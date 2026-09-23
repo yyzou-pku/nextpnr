@@ -110,6 +110,15 @@ struct Spartan3eImpl : ViaductAPI
     /// 上面这些 pad 对应的 IOI bel（用来在布局合法性里拒绝输出）
     std::set<BelId> input_only_bel;
 
+    // ---- W5：引脚约束（PCF）----
+    /// "cellx,celly,ioi" -> 该站点键合的引脚名（如 "P78"）
+    std::map<std::string, std::vector<std::string>> bond_pins;
+    /// 封装引脚名 -> IOB bel
+    std::map<std::string, BelId> pin_bel;
+    /// 端口名 -> 引脚名（来自 PCF 的 `set_io`）
+    std::map<std::string, std::string> pin_constraints;
+    std::string pcf_path;
+
     // ---- T4：专用时钟输入（IBUFG/CLKPAD）的 IOB↔BUFG 配对 ----
     /// IOI 的 `CLKPAD` 输出线 -> 该 IOI bel
     std::map<WireId, BelId> clkpad_src;
@@ -195,9 +204,12 @@ struct Spartan3eImpl : ViaductAPI
         for (auto &kv : root["bond"].object_items()) {
             for (auto &r : kv.second.array_items()) {
                 int cx = 0, cy = 0, bi = 0;
-                if (std::sscanf(r.string_value().c_str(), "D0X%dY%d.IOI[%d]", &cx, &cy, &bi) == 3)
-                    bonded_pads.insert(std::to_string(cx) + "," + std::to_string(cy) + "," +
-                                       std::to_string(bi));
+                if (std::sscanf(r.string_value().c_str(), "D0X%dY%d.IOI[%d]", &cx, &cy, &bi) == 3) {
+                    std::string key = std::to_string(cx) + "," + std::to_string(cy) + "," +
+                                      std::to_string(bi);
+                    bonded_pads.insert(key);
+                    bond_pins[key].push_back(kv.first); // 引脚名（如 "P78"）
+                }
             }
         }
         log_info("Spartan-3E: %zu bonded IOI pads from bond table\n", bonded_pads.size());
@@ -572,8 +584,8 @@ struct Spartan3eImpl : ViaductAPI
         }
     }
 
-    void add_ioi_bel(const TileInst &t, const BelTemplate &b, const std::map<std::string, int> &wm, int &z,
-                     bool input_only)
+    BelId add_ioi_bel(const TileInst &t, const BelTemplate &b, const std::map<std::string, int> &wm,
+                      int &z, bool input_only)
     {
         int x = t.x, y = t.y;
         BelId iob = ctx->addBel(h.xy_id(x, y, ctx->id(b.slot)), id_IOB, Loc(x, y, z), false, false);
@@ -678,6 +690,7 @@ struct Spartan3eImpl : ViaductAPI
             if (nw != WireId())
                 ctx->addBelInput(ooff, id_SR, nw);
         }
+        return iob;
     }
 
     // 全局时钟缓冲（BUFGMUX bel，class=BUFGMUX）。时钟树布线（`GCLK_N/S` → `GCLK_QUAD`
@@ -836,8 +849,11 @@ struct Spartan3eImpl : ViaductAPI
                     // **IOI** 空间，两者不能混用（曾因此把 66 个键合 pad 过滤成 21 个）。
                     // 权威判据只用 bond 表：该 (cell, IOI bel) 是不是真引脚。
                     (void)k;
-                    if (bonded_pads.count(bk))
-                        add_ioi_bel(t, b, wm, z, input_only_ioi.count(bk) > 0);
+                    if (bonded_pads.count(bk)) {
+                        BelId iob = add_ioi_bel(t, b, wm, z, input_only_ioi.count(bk) > 0);
+                        for (auto &p : bond_pins[bk])
+                            pin_bel[p] = iob;
+                    }
                 }
             }
         }
@@ -911,6 +927,66 @@ struct Spartan3eImpl : ViaductAPI
     }
 
     // ---------------- packing ----------------
+    // ---- W5：引脚约束 ----
+    /// 读 PCF 约束文件（只支持 `set_io <port> <pin>`，`#` 注释）
+    void read_pcf()
+    {
+        if (pcf_path.empty())
+            return;
+        std::ifstream f(pcf_path);
+        if (!f)
+            log_error("spartan3e: cannot open PCF '%s'\n", pcf_path.c_str());
+        std::string line;
+        int n = 0;
+        while (std::getline(f, line)) {
+            auto cp = line.find('#');
+            if (cp != std::string::npos)
+                line = line.substr(0, cp);
+            std::istringstream ss(line);
+            std::string kw, port, pin;
+            if (!(ss >> kw >> port >> pin))
+                continue;
+            if (kw == "set_io") {
+                pin_constraints[port] = pin;
+                n++;
+            }
+        }
+        log_info("Spartan-3E: %d pin constraint(s) from '%s'\n", n, pcf_path.c_str());
+    }
+
+    /// 把 PCF 引脚约束绑到对应的 pad cell（`$iopadmap$top.<port>`），强度 USER = 固定。
+    void apply_pin_constraints()
+    {
+        for (auto &kv : pin_constraints) {
+            const std::string &port = kv.first;
+            const std::string &pin = kv.second;
+            auto bit = pin_bel.find(pin);
+            if (bit == pin_bel.end()) {
+                log_warning("spartan3e: PCF: unknown pin '%s' for port '%s'\n", pin.c_str(),
+                            port.c_str());
+                continue;
+            }
+            // `q[3]` -> `q_3`（iopadmap 的 cell 命名）
+            std::string cname = port;
+            for (auto &ch : cname)
+                if (ch == '[' || ch == ']')
+                    ch = '_';
+            while (!cname.empty() && cname.back() == '_')
+                cname.pop_back();
+            auto cit = ctx->cells.find(ctx->id("$iopadmap$top." + cname));
+            if (cit == ctx->cells.end()) {
+                log_warning("spartan3e: PCF: no pad cell for port '%s'\n", port.c_str());
+                continue;
+            }
+            CellInfo *c = cit->second.get();
+            if (c->bel != BelId())
+                ctx->unbindBel(c->bel);
+            ctx->bindBel(bit->second, c, STRENGTH_USER);
+            log_info("Spartan-3E: port '%s' -> pin %s (%s)\n", port.c_str(), pin.c_str(),
+                     ctx->getBelName(bit->second).str(ctx).c_str());
+        }
+    }
+
     void pack() override
     {
         // 去掉 nextpnr 自动插的 IOB（IO 缓冲已在综合阶段映射到 INBUF/OUTBUF）
@@ -921,6 +997,8 @@ struct Spartan3eImpl : ViaductAPI
                 CellTypePort(id_IOBUF, id_PAD),
         };
         h.remove_nextpnr_iobs(top_ports);
+        read_pcf();
+        apply_pin_constraints();
         // 常量 → LUT
         const dict<IdString, Property> vcc_params = {{id_INIT, Property(0xFFFF, 16)}};
         const dict<IdString, Property> gnd_params = {{id_INIT, Property(0x0000, 16)}};
@@ -1408,6 +1486,8 @@ struct Spartan3eArch : ViaductArch
             impl->db_path = args.at("db");
         if (args.count("dump"))
             impl->dump_path = args.at("dump");
+        if (args.count("pcf"))
+            impl->pcf_path = args.at("pcf");
         return impl;
     }
 } spartan3eArch;
