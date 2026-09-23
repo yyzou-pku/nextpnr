@@ -947,72 +947,113 @@ struct Spartan3eImpl : ViaductAPI
     // 真实器件与 ISE 同此约束。
     bool isBelLocationValid(BelId bel, bool explain_invalid) const override
     {
-        // T7：LUT4/LUT5/LUT6/LUT7/LUT8 共用 slice 的 F/G LUT 资源。
-        // footprint 用 (x, y, slice, half) 表示（LUT8 跨本 CLB + 上方 (x,y+1)）：
-        //   LUT4 (F) -> {(x,y,i,F)}      LUT4Y (G) -> {(x,y,i,G)}
-        //   LUT5     -> {(x,y,i,F),(x,y,i,G)}
-        //   LUT6 (h) -> {(x,y,h,*),(x,y,h+2,*)}
-        //   LUT7     -> {(x,y,0..3,*)}
-        //   LUT8     -> {(x,y,0..3,*),(x,y+1,0..3,*)}
-        // 判定必须**对称**：新 bel vs 所有已放 LUT（含跨 CLB 的 LUT8）。
-        if (ctx->getBelType(bel).in(id_LUT4, id_LUT5, id_LUT6, id_LUT7, id_LUT8)) {
+        // T7/T8：CLB slice 内的「互斥资源」用 (x, y, slice, kind) 集合表示：
+        //   kind: 0=F-LUT, 1=G-LUT, 2=BX, 3=BY
+        // - LUT4 (F)/(G) 占 {*,F/G}；LUT5/6/7/8 额外占对应 slice 的 BX（LUT6/7/8 还占 BY）。
+        // - slice FF 的 **D** 在 uarch 里绑到 BX（F 半）/ BY（G 半）——因为 DXMUX/DYMUX
+        //   走的是 `X→BX`/`Y→BY` 的内部路径。所以 FF 也占一个 BX/BY。
+        // 于是「宽 LUT 的 BX/BY」与「同 slice 的 FF」天然互斥（物理上也共享同一根 BX/BY 线），
+        // 判定必须**对称**且跨 CLB（LUT8 影响 (x,y) 与 (x,y+1)）。
+        IdString bt = ctx->getBelType(bel);
+        auto resources = [](IdString t, Loc loc, const std::string &n) {
+            std::vector<std::array<int, 4>> o; // (x, y, slice, kind)
+            int x = loc.x, y = loc.y;
+            auto add = [&](int yy, int sl, int k) { o.push_back({x, yy, sl, k}); };
+            auto fg = [&](int yy, int sl) { add(yy, sl, 0); add(yy, sl, 1); };
+            if (t == id_LUT5) {
+                int sl = loc.z / 5;
+                fg(y, sl); add(y, sl, 2);
+            } else if (t == id_LUT6) {
+                int hf = (!n.empty() && n.back() == '0') ? 0 : 1;
+                for (int sl : {hf, hf + 2}) { fg(y, sl); add(y, sl, 2); }
+                add(y, hf, 3);
+            } else if (t == id_LUT7) {
+                for (int sl = 0; sl < 4; sl++) { fg(y, sl); add(y, sl, 2); }
+                for (int sl = 0; sl < 3; sl++) add(y, sl, 3);
+            } else if (t == id_LUT8) {
+                for (int yy : {y, y + 1}) {
+                    for (int sl = 0; sl < 4; sl++) { fg(yy, sl); add(yy, sl, 2); }
+                    for (int sl = 0; sl < 3; sl++) add(yy, sl, 3);
+                }
+            } else if (t == id_LUT4) {
+                int r = loc.z % 5;
+                add(y, loc.z / 5, (r == 0) ? 0 : 1);
+            } else if (t == id_DFF) { // SLICE FF：D 绑 BX（F 半）/ BY（G 半）
+                auto pos = n.find("SLICE");
+                if (pos != std::string::npos) {
+                    int sl = n[pos + 5] - '0';
+                    bool is_y = n.size() >= 4 && n.compare(n.size() - 4, 4, "_FFY") == 0;
+                    add(y, sl, is_y ? 3 : 2);
+                }
+            }
+            return o;
+        };
+        auto intersects = [](const std::vector<std::array<int, 4>> &a,
+                             const std::vector<std::array<int, 4>> &b) {
+            for (auto &u : a)
+                for (auto &v : b)
+                    if (u == v)
+                        return true;
+            return false;
+        };
+        auto check_against = [&](IdString mine_type, Loc l, const std::string &nm,
+                                 IdString other_type, const std::string &onm, Loc ol) {
+            return intersects(resources(mine_type, l, nm), resources(other_type, ol, onm));
+        };
+        if (bt.in(id_LUT4, id_LUT5, id_LUT6, id_LUT7, id_LUT8)) {
             CellInfo *c = ctx->getBoundBelCell(bel);
             if (c == nullptr)
                 return true;
             Loc l = ctx->getBelLocation(bel);
             std::string nm = ctx->getBelName(bel).str(ctx);
-            auto footprint = [](IdString t, Loc loc, const std::string &n) {
-                std::vector<std::array<int, 4>> o; // (x, y, slice, half)
-                int x = loc.x, y = loc.y;
-                auto add = [&](int yy, int sl, int hf) { o.push_back({x, yy, sl, hf}); };
-                if (t == id_LUT5) {
-                    int sl = loc.z / 5;
-                    add(y, sl, 0); add(y, sl, 1);
-                } else if (t == id_LUT6) {
-                    int hf = (!n.empty() && n.back() == '0') ? 0 : 1;
-                    for (int sl : {hf, hf + 2}) { add(y, sl, 0); add(y, sl, 1); }
-                } else if (t == id_LUT7) {
-                    for (int sl = 0; sl < 4; sl++) { add(y, sl, 0); add(y, sl, 1); }
-                } else if (t == id_LUT8) {
-                    for (int yy : {y, y + 1})
-                        for (int sl = 0; sl < 4; sl++) { add(yy, sl, 0); add(yy, sl, 1); }
-                } else { // LUT4
-                    int r = loc.z % 5;
-                    add(y, loc.z / 5, (r == 0) ? 0 : 1);
-                }
-                return o;
-            };
-            auto mine = footprint(ctx->getBelType(bel), l, nm);
             for (auto &cl : ctx->cells) {
                 CellInfo *o = cl.second.get();
                 if (o == c || o->bel == BelId())
                     continue;
                 IdString ot = ctx->getBelType(o->bel);
-                if (!ot.in(id_LUT4, id_LUT5, id_LUT6, id_LUT7, id_LUT8))
+                if (!ot.in(id_LUT4, id_LUT5, id_LUT6, id_LUT7, id_LUT8) && ot != id_DFF)
                     continue;
                 Loc ol = ctx->getBelLocation(o->bel);
                 // 快速排除：不同列，或行距 >1（LUT8 最多影响相邻 CLB）
                 if (ol.x != l.x || ol.y < l.y - 1 || ol.y > l.y + 1)
                     continue;
-                auto theirs = footprint(ot, ol, ctx->getBelName(o->bel).str(ctx));
-                for (auto &a : mine)
-                    for (auto &b2 : theirs)
-                        if (a == b2)
-                            return false;
+                if (check_against(bt, l, nm, ot, ctx->getBelName(o->bel).str(ctx), ol))
+                    return false;
             }
             return true;
         }
         // T5b：只允许 pack 过（D 已接到 pad）的 FF 落到 IOB 输入 FF bel。
         // T8：且只接受**不带 SR** 的 FF（`DFF`/`DFFE`）—— IFD（IOB 输入 FF）的复位路径
         // 位表尚未建模（chipdb 缺 IOI SR 类 attr，见 TODO T8），带复位的 FF 留在 CLB。
-        if (ctx->getBelType(bel) == id_IOB_FF) {
+        if (bt == id_IOB_FF) {
             CellInfo *c = ctx->getBoundBelCell(bel);
             if (c == nullptr)
                 return true;
             return c->attrs.count(id_IOB_FF) > 0 && c->type.in(id_DFF, id_DFFE);
         }
-        if (ctx->getBelType(bel) != id_DFF)
+        if (bt != id_DFF)
             return true;
+        // FF 侧也要检查：是否与同 slice 的宽 LUT 争 BX/BY。
+        {
+            CellInfo *c = ctx->getBoundBelCell(bel);
+            if (c != nullptr) {
+                Loc l = ctx->getBelLocation(bel);
+                std::string nm = ctx->getBelName(bel).str(ctx);
+                for (auto &cl : ctx->cells) {
+                    CellInfo *o = cl.second.get();
+                    if (o == c || o->bel == BelId())
+                        continue;
+                    IdString ot = ctx->getBelType(o->bel);
+                    if (!ot.in(id_LUT4, id_LUT5, id_LUT6, id_LUT7, id_LUT8))
+                        continue;
+                    Loc ol = ctx->getBelLocation(o->bel);
+                    if (ol.x != l.x || ol.y < l.y - 1 || ol.y > l.y + 1)
+                        continue;
+                    if (check_against(bt, l, nm, ot, ctx->getBelName(o->bel).str(ctx), ol))
+                        return false;
+                }
+            }
+        }
         Loc l = ctx->getBelLocation(bel);
         // SLICE<i>_FF 在 z+1、SLICE<i>_FFY 在 z+3；配对的是另一半
         std::string nm = ctx->getBelName(bel).str(ctx);
