@@ -646,6 +646,38 @@ struct Spartan3eImpl : ViaductAPI
             if (nw != WireId())
                 ctx->addBelInput(ioff, id_SR, nw);
         }
+
+        // T8c：IOB 输出 FF（IOI 的 OFF1/OFF2）。与输入 FF 相对：D ← 来自 fabric 的 `O1`，
+        // Q → 只驱动 IOI 内部的输出缓冲（用一条哑线承载，不入 fabric）。
+        // CLK/CE/SR ← `OTCLK1`/`OCE`/`SR`。pack() 把「DFF.Q 驱动 OUTBUF.I」的 FF 移到这里，
+        // 并给 OUTBUF 注入 `OMUX::OFF1` 等参数；见 docs/t8c-iob-ff-sr.md。
+        BelId ooff = ctx->addBel(h.xy_id(x, y, ctx->idf("IOB_OFF%d", parse_bracket_index(b.slot))),
+                                 id_IOB_OFF, Loc(x, y, z), false, false);
+        z++;
+        if (const std::string *w = pin_of(b, "O1")) {
+            WireId nw = lookup(wm, *w);
+            if (nw != WireId())
+                ctx->addBelInput(ooff, id_D, nw);
+        }
+        {
+            WireId qw = ctx->addWire(h.xy_id(x, y, ctx->idf("OFFQ%d", zi)), id_Q, x, y);
+            ctx->addBelOutput(ooff, id_Q, qw);
+        }
+        if (const std::string *w = pin_of(b, "OTCLK1")) {
+            WireId nw = lookup(wm, *w);
+            if (nw != WireId())
+                ctx->addBelInput(ooff, id_CLK, nw);
+        }
+        if (const std::string *w = pin_of(b, "OCE")) {
+            WireId nw = lookup(wm, *w);
+            if (nw != WireId())
+                ctx->addBelInput(ooff, id_CE, nw);
+        }
+        if (const std::string *w = pin_of(b, "SR")) {
+            WireId nw = lookup(wm, *w);
+            if (nw != WireId())
+                ctx->addBelInput(ooff, id_SR, nw);
+        }
     }
 
     // 全局时钟缓冲（BUFGMUX bel，class=BUFGMUX）。时钟树布线（`GCLK_N/S` → `GCLK_QUAD`
@@ -893,6 +925,66 @@ struct Spartan3eImpl : ViaductAPI
         const dict<IdString, Property> vcc_params = {{id_INIT, Property(0xFFFF, 16)}};
         const dict<IdString, Property> gnd_params = {{id_INIT, Property(0x0000, 16)}};
         h.replace_constants(CellTypePort(id_LUT4, id_F), CellTypePort(id_LUT4, id_F), vcc_params, gnd_params);
+
+        // T8c：IOB 输出 FF。必须**先于** LUT-FF 配对（否则 D 来自 LUT 的 FF 会先被绑到 slice）。
+        // 把「DFF 的 Q 只驱动一个 OUTBUF/OBUFT/IOBUF 的 I」的 FF 打包进 `IOB_OFF` bel
+        // （与 OUTBUF 同 tile，IOB 在 z、IOB_FF 在 z+1、IOB_OFF 在 z+2）。
+        // 只接受无复位 / **异步**复位 FF（IOI 输出 FF 无 `SYNC_ATTR`）。
+        if (getenv("S3E_NO_IOB_OFF") == nullptr) {
+            int ioboffs = 0;
+            for (auto &cell : ctx->cells) {
+                CellInfo *ob = cell.second.get();
+                if (!ob->type.in(id_OUTBUF, id_OBUFT, id_IOBUF) || ob->cluster != ClusterId())
+                    continue;
+                NetInfo *in = ob->getPort(id_I);
+                if (!in || in->driver.cell == nullptr)
+                    continue;
+                CellInfo *ff = in->driver.cell;
+                if (!ff->type.in(id_DFF, id_DFFE, id_DFFC, id_DFFP, id_DFFCE, id_DFFPE))
+                    continue;
+                if (ff->cluster != ClusterId())
+                    continue;
+                if (in->users.entries() > 1)
+                    continue; // FF 的 Q 还驱动别处 -- 不能搬进 IOB
+                // 若 D 直接由 pad（输入 buffer）驱动，优先让它进 **IOB 输入 FF**（无需布线，
+                // 与 ISE 一致）；否则才考虑输出 FF。
+                NetInfo *dn = ff->getPort(id_D);
+                if (dn != nullptr && dn->driver.cell != nullptr &&
+                    dn->driver.cell->type == id_INBUF)
+                    continue;
+                // 手动建 cluster：根 = pad cell（位置受焊盘约束），子 = FF（z+2 = IOB_OFF）
+                ob->cluster = ob->name;
+                ob->constr_abs_z = false;
+                ob->constr_children.push_back(ff);
+                ff->cluster = ob->name;
+                ff->constr_x = 0;
+                ff->constr_y = 0;
+                ff->constr_z = 2;
+                ff->constr_abs_z = false;
+                ff->setAttr(id_IOB_OFF, Property(1));
+                // 物理上输出缓冲取样自 FF（OMUX=FFO1），O1 只接 FF.D。把 OUTBUF.I 从原
+                // Q 网改接到 FF.D 网（= O1）：既让 O1 只承载 FF.D（否则和 OUTBUF.I 争线），
+                // 又保持 OUTBUF 有输入连接（不能直接断开：HeAP 会把无连接的根 cell 当作
+                // 「已锁定」而不放进 place_cells，total_hpwl 会抛 dict::at()）。
+                NetInfo *dnet = ff->getPort(id_D);
+                if (dnet != nullptr && dnet != in) {
+                    ob->disconnectPort(id_I);
+                    ob->connectPort(id_I, dnet);
+                }
+                ob->setParam(ctx->id("OMUX"), Property(std::string("OFF1")));
+                ob->setParam(ctx->id("OFF1_INIT_ATTR"), Property(std::string("INIT0")));
+                if (ff->type.in(id_DFFC, id_DFFCE, id_DFFP, id_DFFPE)) {
+                    bool high = ff->type.in(id_DFFP, id_DFFPE);
+                    ob->setParam(ctx->id("OFF1_SR_ATTR"),
+                                 Property(std::string(high ? "SRHIGH" : "SRLOW")));
+                    ob->setParam(ctx->id("OSR_USED"), Property(std::string("0")));
+                    ob->setParam(ctx->id("SRINV"), Property(std::string("SR")));
+                }
+                ioboffs++;
+            }
+            log_info("Constrained %d IOB output-FF pairs.\n", ioboffs);
+        }
+
         // LUT 与 FF 绑到同一个 SLICE：FF 相对 LUT 偏移 z+1
         int lutffs = h.constrain_cell_pairs(pool<CellTypePort>{{id_LUT4, id_F}}, pool<CellTypePort>{{id_DFF, id_D}}, 1);
         log_info("Constrained %d LUTFF pairs.\n", lutffs);
@@ -908,8 +1000,10 @@ struct Spartan3eImpl : ViaductAPI
         // INBUF 直接喂 DFF → 把 DFF 打包进 IOB 输入 FF（`IOB_FF bel`，与 IOB 同 tile、z+1）。
         // 然后把 DFF.D 从 INBUF.O 改接到 pad（IOB_FF 的 D 绑的是 pad），并删掉旧网。
         pool<CellTypePort> ff_d_ports;
-        // T8：**只**把无复位的 FF（`DFF`/`DFFE`）打包进 IOB 输入 FF —— IFD 的复位路径未建模。
-        for (IdString t : {id_DFF, id_DFFE})
+        // T8c：无复位（`DFF`/`DFFE`）与**异步**复位（`DFFC`/`DFFP`/`DFFCE`/`DFFPE`）的 FF 都可
+        // 打包进 IOB 输入 FF —— IFD 的复位是异步的（IOI 无 `SYNC_ATTR`）。同步复位类
+        // （`DFFR`/`DFFS`/`DFFRE`/`DFFSE`）留在 CLB，IOI 无法表达。位表见 patch-ioi-bits.py。
+        for (IdString t : {id_DFF, id_DFFE, id_DFFC, id_DFFP, id_DFFCE, id_DFFPE})
             ff_d_ports.insert(CellTypePort(t, id_D));
         iobffs = h.constrain_cell_pairs(pool<CellTypePort>{{id_INBUF, id_O}}, ff_d_ports, 1, false);
         for (auto &cell : ctx->cells) {
@@ -935,12 +1029,19 @@ struct Spartan3eImpl : ViaductAPI
             ff->setAttr(id_IOB_FF, Property(1));
             // T5b：给 INBUF 注入输入 FF 参数，使 s3pack 走与 ISE `rff4` 完全相同（已验证 0/0）
             // 的路径：IOB 侧写 IFD 延时（ISE 输入 FF 默认 `DLY3`）+ IOI 侧写 IFF 配置。
-            // T8：仅无复位的 FF（`DFF`/`DFFE`）才进 IOB；带 SR 的留 CLB（位表未建模）。
-            if (ff->type.in(id_DFF, id_DFFE)) {
+            if (ff->type.in(id_DFF, id_DFFE, id_DFFC, id_DFFP, id_DFFCE, id_DFFPE)) {
                 ib->setParam(ctx->id("IFF1"), Property(std::string("1")));
                 ib->setParam(ctx->id("ICLK1INV"), Property(std::string("ICLK1")));
                 ib->setParam(ctx->id("IFF1_INIT_ATTR"), Property(std::string("INIT0")));
                 ib->setParam(ctx->id("IFD_DELAY_VALUE"), Property(std::string("DLY3")));
+                // T8c：异步复位的 FF 还要写 IOI 的 SR 配置（SRLOW/SRHIGH + used + 反相）。
+                if (ff->type.in(id_DFFC, id_DFFCE, id_DFFP, id_DFFPE)) {
+                    bool high = ff->type.in(id_DFFP, id_DFFPE);
+                    ib->setParam(ctx->id("IFF1_SR_ATTR"),
+                                 Property(std::string(high ? "SRHIGH" : "SRLOW")));
+                    ib->setParam(ctx->id("ISR_USED"), Property(std::string("0")));
+                    ib->setParam(ctx->id("SRINV"), Property(std::string("SR")));
+                }
             }
         }
         }
@@ -1032,11 +1133,13 @@ struct Spartan3eImpl : ViaductAPI
         // T5b：只允许 pack 过（D 已接到 pad）的 FF 落到 IOB 输入 FF bel。
         // T8：且只接受**不带 SR** 的 FF（`DFF`/`DFFE`）—— IFD（IOB 输入 FF）的复位路径
         // 位表尚未建模（chipdb 缺 IOI SR 类 attr，见 TODO T8），带复位的 FF 留在 CLB。
-        if (bt == id_IOB_FF) {
+        if (bt == id_IOB_FF || bt == id_IOB_OFF) {
             CellInfo *c = ctx->getBoundBelCell(bel);
             if (c == nullptr)
                 return true;
-            return c->attrs.count(id_IOB_FF) > 0 && c->type.in(id_DFF, id_DFFE);
+            // T8c：只接受无复位与**异步**复位 FF（见 pack()）。
+            return c->attrs.count(bt) > 0 &&
+                   c->type.in(id_DFF, id_DFFE, id_DFFC, id_DFFP, id_DFFCE, id_DFFPE);
         }
         if (bt != id_DFF)
             return true;
@@ -1130,7 +1233,7 @@ struct Spartan3eImpl : ViaductAPI
             std::set<CellInfo *> need_global;
             for (auto &cell : ctx->cells) {
                 CellInfo *ff = cell.second.get();
-                if (!ff->attrs.count(id_IOB_FF))
+                if (!ff->attrs.count(id_IOB_FF) && !ff->attrs.count(id_IOB_OFF))
                     continue;
                 NetInfo *clk = ff->getPort(id_CLK);
                 if (!clk || !clk->driver.cell)
@@ -1261,12 +1364,12 @@ struct Spartan3eImpl : ViaductAPI
     BelBucketId getBelBucketForBel(BelId bel) const override
     {
         IdString t = ctx->getBelType(bel);
-        return (t == id_IOB_FF) ? id_DFF : t;
+        return (t == id_IOB_FF || t == id_IOB_OFF) ? id_DFF : t;
     }
     bool isValidBelForCellType(IdString cell_type, BelId bel) const override
     {
         IdString bel_type = ctx->getBelType(bel);
-        if (bel_type == id_IOB_FF)
+        if (bel_type == id_IOB_FF || bel_type == id_IOB_OFF)
             return is_ff_type(cell_type);
         if (bel_type == id_IOB) {
             // 只能输入的 pad 只接受 IBUF（其余带输出的 cell 拒绝）。
