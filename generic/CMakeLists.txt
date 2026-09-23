@@ -14,6 +14,8 @@ set(SOURCES
     viaduct_helpers.h
     viaduct/example/constids.inc
     viaduct/example/example.cc
+    viaduct/spartan3e/constids.inc
+    viaduct/spartan3e/spartan3e.cc
     viaduct/fabulous/constids.inc
     viaduct/fabulous/fab_cfg.h
     viaduct/fabulous/fab_defs.h
