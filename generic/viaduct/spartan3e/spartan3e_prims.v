@@ -22,45 +22,45 @@ endmodule
 // ---- FF：CE / 复位（SR）的组合 ----
 // 同步复位类（FF_SR_SYNC = 1）：DFFR / DFFS / DFFRE / DFFSE
 // 异步类（FF_SR_SYNC = 0，保持器件默认）：DFFC / DFFP
-module DFF   (input CLK, D, output reg Q);
-    initial Q = 1'b0;
+module DFF #(parameter INIT = 1'b0)   (input CLK, D, output reg Q);
+    initial Q = INIT;
     always @(posedge CLK) Q <= D;
 endmodule
-module DFFE  (input CLK, D, CE, output reg Q);
-    initial Q = 1'b0;
+module DFFE #(parameter INIT = 1'b0)  (input CLK, D, CE, output reg Q);
+    initial Q = INIT;
     always @(posedge CLK) if (CE) Q <= D;
 endmodule
-module DFFR  (input CLK, D, SR, output reg Q);
-    initial Q = 1'b0;
+module DFFR #(parameter INIT = 1'b0)  (input CLK, D, SR, output reg Q);
+    initial Q = INIT;
     always @(posedge CLK) if (SR) Q <= 1'b0; else Q <= D;
 endmodule
-module DFFS  (input CLK, D, SR, output reg Q);
-    initial Q = 1'b0;
+module DFFS #(parameter INIT = 1'b0)  (input CLK, D, SR, output reg Q);
+    initial Q = INIT;
     always @(posedge CLK) if (SR) Q <= 1'b1; else Q <= D;
 endmodule
-module DFFRE (input CLK, D, SR, CE, output reg Q);
-    initial Q = 1'b0;
+module DFFRE #(parameter INIT = 1'b0) (input CLK, D, SR, CE, output reg Q);
+    initial Q = INIT;
     always @(posedge CLK) if (SR) Q <= 1'b0; else if (CE) Q <= D;
 endmodule
-module DFFSE (input CLK, D, SR, CE, output reg Q);
-    initial Q = 1'b0;
+module DFFSE #(parameter INIT = 1'b0) (input CLK, D, SR, CE, output reg Q);
+    initial Q = INIT;
     always @(posedge CLK) if (SR) Q <= 1'b1; else if (CE) Q <= D;
 endmodule
-module DFFC  (input CLK, D, SR, output reg Q);
-    initial Q = 1'b0;
+module DFFC #(parameter INIT = 1'b0)  (input CLK, D, SR, output reg Q);
+    initial Q = INIT;
     always @(posedge CLK or posedge SR) if (SR) Q <= 1'b0; else Q <= D;
 endmodule
-module DFFP  (input CLK, D, SR, output reg Q);
-    initial Q = 1'b0;
+module DFFP #(parameter INIT = 1'b0)  (input CLK, D, SR, output reg Q);
+    initial Q = INIT;
     always @(posedge CLK or posedge SR) if (SR) Q <= 1'b1; else Q <= D;
 endmodule
 // T8：异步复位/置位 + 时钟使能（对应 Yosys `$_DFFE_PP0P_`/`$_DFFE_PP1P_`）
-module DFFCE (input CLK, D, CE, SR, output reg Q);
-    initial Q = 1'b0;
+module DFFCE #(parameter INIT = 1'b0) (input CLK, D, CE, SR, output reg Q);
+    initial Q = INIT;
     always @(posedge CLK or posedge SR) if (SR) Q <= 1'b0; else if (CE) Q <= D;
 endmodule
-module DFFPE (input CLK, D, CE, SR, output reg Q);
-    initial Q = 1'b0;
+module DFFPE #(parameter INIT = 1'b0) (input CLK, D, CE, SR, output reg Q);
+    initial Q = INIT;
     always @(posedge CLK or posedge SR) if (SR) Q <= 1'b1; else if (CE) Q <= D;
 endmodule
 
