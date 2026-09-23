@@ -865,7 +865,14 @@ struct Spartan3eImpl : ViaductAPI
                     WireId sw = node_wires.at(sit->second);
                     if (sw == dw)
                         continue;
-                    add_pip(sw, dw, loc, pip_delay(p.src, p.dst), meta_of(cidx, pi, 0));
+                    // T13: `proginv` is a *permanent* buffer whose bit only selects polarity
+                    // (prjcombine `ProgInv`: bit=1 -> inverted, bit=0 -> straight). The uarch
+                    // does not model per-FF polarity (CLKINV/CEINV/SRINV), so expose it as a
+                    // permanent non-inverting (virtual) edge: the router traverses it for free
+                    // and s3pack writes no bit -> the bit stays 0 (non-inverted), which is
+                    // correct for active-high logic. See docs/known-issues.md I7.
+                    uint64_t pmeta = (p.kind == "proginv") ? META_VIRTUAL : meta_of(cidx, pi, 0);
+                    add_pip(sw, dw, loc, pip_delay(p.src, p.dst), pmeta);
                 }
             }
         }
