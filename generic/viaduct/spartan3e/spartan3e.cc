@@ -966,19 +966,33 @@ struct Spartan3eImpl : ViaductAPI
                             port.c_str());
                 continue;
             }
-            // `q[3]` -> `q_3`（iopadmap 的 cell 命名）
-            std::string cname = port;
-            for (auto &ch : cname)
-                if (ch == '[' || ch == ']')
-                    ch = '_';
-            while (!cname.empty() && cname.back() == '_')
-                cname.pop_back();
-            auto cit = ctx->cells.find(ctx->id("$iopadmap$top." + cname));
-            if (cit == ctx->cells.end()) {
+            // iopadmap 的 cell 命名：bit0 = `q`（**无后缀**），bitn = `q_<n>`；标量 = 原名。
+            std::string base = port, idx;
+            auto lb = port.find('[');
+            if (lb != std::string::npos) {
+                base = port.substr(0, lb);
+                idx = port.substr(lb + 1);
+                if (!idx.empty() && idx.back() == ']')
+                    idx.pop_back();
+            }
+            std::vector<std::string> cands;
+            if (!idx.empty() && idx != "0")
+                cands.push_back(base + "_" + idx);
+            cands.push_back(base);
+            if (!idx.empty() && idx != "0")
+                cands.push_back(base + "_" + idx + "_"); // 宽松：旧命名
+            CellInfo *c = nullptr;
+            for (auto &cn : cands) {
+                auto cit = ctx->cells.find(ctx->id("$iopadmap$top." + cn));
+                if (cit != ctx->cells.end()) {
+                    c = cit->second.get();
+                    break;
+                }
+            }
+            if (c == nullptr) {
                 log_warning("spartan3e: PCF: no pad cell for port '%s'\n", port.c_str());
                 continue;
             }
-            CellInfo *c = cit->second.get();
             if (c->bel != BelId())
                 ctx->unbindBel(c->bel);
             ctx->bindBel(bit->second, c, STRENGTH_USER);
