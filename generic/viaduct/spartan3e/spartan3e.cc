@@ -1044,6 +1044,35 @@ struct Spartan3eImpl : ViaductAPI
                 if (dn != nullptr && dn->driver.cell != nullptr &&
                     dn->driver.cell->type == id_INBUF)
                     continue;
+                // 若 OUTBUF 已因 PCF 绑定了 bel（STRENGTH_USER），HeAP 不会把 cluster root
+                // 放进 place_cells，于是子 FF 永远拿不到位置，`total_hpwl` 抛 `dict::at()`
+                // （如 `reg q=0; always @(posedge clk) q<=1'b1;`）。直接把 FF 绑到同 tile
+                // 的 `IOB_OFF` bel（z+2），让整个 cluster 已放置。
+                BelId off_bel = BelId();
+                Loc off_loc;
+                if (ob->bel != BelId()) {
+                    Loc ol = ctx->getBelLocation(ob->bel);
+                    off_loc = ol;
+                    for (auto bel : ctx->getBels()) {
+                        if (ctx->getBelType(bel) != id_IOB_OFF)
+                            continue;
+                        Loc l = ctx->getBelLocation(bel);
+                        if (l.x == ol.x && l.y == ol.y) {
+                            off_bel = bel;
+                            break;
+                        }
+                    }
+                    if (off_bel == BelId()) {
+                        log_error("spartan3e: IOB tile (%d,%d) has no IOB_OFF bel for the "
+                                  "packed output FF '%s' (chipdb/uarch inconsistency)\n",
+                                  ol.x, ol.y, ff->name.c_str(ctx));
+                    } else if (CellInfo *bound = ctx->getBoundBelCell(off_bel)) {
+                        log_warning("spartan3e: IOB_OFF bel at (%d,%d) already used by '%s'; "
+                                    "leaving output FF '%s' for the CLB packer\n",
+                                    off_loc.x, off_loc.y, bound->name.c_str(ctx), ff->name.c_str(ctx));
+                        continue;
+                    }
+                }
                 // 手动建 cluster：根 = pad cell（位置受焊盘约束），子 = FF（z+2 = IOB_OFF）
                 ob->cluster = ob->name;
                 ob->constr_abs_z = false;
@@ -1054,6 +1083,8 @@ struct Spartan3eImpl : ViaductAPI
                 ff->constr_z = 2;
                 ff->constr_abs_z = false;
                 ff->setAttr(id_IOB_OFF, Property(1));
+                if (off_bel != BelId())
+                    ctx->bindBel(off_bel, ff, STRENGTH_USER);
                 // 物理上输出缓冲取样自 FF（OMUX=FFO1），O1 只接 FF.D。把 OUTBUF.I 从原
                 // Q 网改接到 FF.D 网（= O1）：既让 O1 只承载 FF.D（否则和 OUTBUF.I 争线），
                 // 又保持 OUTBUF 有输入连接（不能直接断开：HeAP 会把无连接的根 cell 当作
@@ -1118,6 +1149,33 @@ struct Spartan3eImpl : ViaductAPI
             (void)ib;
             (void)dn;
             (void)padnet;
+            // 同输出 FF：INBUF 若因 PCF 已绑定 bel，HeAP 不会把 cluster root 放进
+            // place_cells，子 FF 拿不到位置 → `total_hpwl` 抛 `dict::at()`。直接绑到同 tile
+            // 的 `IOB_FF` bel（z+1）。
+            if (ib->bel != BelId()) {
+                Loc il = ctx->getBelLocation(ib->bel);
+                BelId ff_bel = BelId();
+                for (auto bel : ctx->getBels()) {
+                    if (ctx->getBelType(bel) != id_IOB_FF)
+                        continue;
+                    Loc l = ctx->getBelLocation(bel);
+                    if (l.x == il.x && l.y == il.y) {
+                        ff_bel = bel;
+                        break;
+                    }
+                }
+                if (ff_bel == BelId()) {
+                    log_error("spartan3e: IOB tile (%d,%d) has no IOB_FF bel for the "
+                              "packed input FF '%s' (chipdb/uarch inconsistency)\n",
+                              il.x, il.y, ff->name.c_str(ctx));
+                } else if (CellInfo *bound = ctx->getBoundBelCell(ff_bel)) {
+                    log_warning("spartan3e: IOB_FF bel at (%d,%d) already used by '%s'; "
+                                "leaving input FF '%s' for the CLB packer\n",
+                                il.x, il.y, bound->name.c_str(ctx), ff->name.c_str(ctx));
+                    continue;
+                }
+                ctx->bindBel(ff_bel, ff, STRENGTH_USER);
+            }
             ff->setAttr(id_IOB_FF, Property(1));
             // T5b：给 INBUF 注入输入 FF 参数，使 s3pack 走与 ISE `rff4` 完全相同（已验证 0/0）
             // 的路径：IOB 侧写 IFD 延时（ISE 输入 FF 默认 `DLY3`）+ IOI 侧写 IFF 配置。
