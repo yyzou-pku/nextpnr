@@ -1445,6 +1445,15 @@ struct Spartan3eImpl : ViaductAPI
             for (auto &p : ci->params)
                 params[p.first.str(ctx)] = p.second.to_string();
             b["params"] = params;
+            // 记录端口→网名：s3pack 用它判断 OUTBUF 的 `I` / INBUF 的 `O` 是否真的接了。
+            // 未接/常量驱动的输出 pad（如 multibufg 的 qb[3:1] 被 yosys 折成 x）不能被当成
+            // 输出写 MUX_O/OUTPUT_ENABLE（ISE 对未接输出写 NONE）——见 T26/T33。
+            json11::Json::object conn;
+            for (auto &p : ci->ports) {
+                if (p.second.net != nullptr)
+                    conn[p.first.str(ctx)] = p.second.net->name.str(ctx);
+            }
+            b["conn"] = conn;
             if (ci->cluster != ClusterId())
                 b["cluster"] = ci->cluster.str(ctx);
             bels.push_back(b);
