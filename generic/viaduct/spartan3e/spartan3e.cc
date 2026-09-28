@@ -814,7 +814,7 @@ struct Spartan3eImpl : ViaductAPI
             for (auto &b : cit->second.bels) {
                 if (b.kind != "bel")
                     continue;
-                if (b.cls == "SLICE") {
+                if (is_slice_cls(b.cls)) {
                     add_slice_bels(t, b, wm, z);
                     slice_tmpls.push_back(b);
                     if (slice_tmpls.size() == 4) {
@@ -830,7 +830,7 @@ struct Spartan3eImpl : ViaductAPI
                                 break;
                             std::vector<BelTemplate> sl2;
                             for (auto &b2 : cit2->second.bels)
-                                if (b2.kind == "bel" && b2.cls == "SLICE")
+                                if (b2.kind == "bel" && is_slice_cls(b2.cls))
                                     sl2.push_back(b2);
                             if (sl2.size() == 4)
                                 add_lut8_bel(t, slice_tmpls, wm, sl2, *wm2p, z);
@@ -840,7 +840,7 @@ struct Spartan3eImpl : ViaductAPI
                 }
                 else if (b.cls == "BUFGMUX")
                     add_bufg_bel(t, b, wm, z);
-                else if (b.cls == "IOI") {
+                else if (is_ioi_cls(b.cls)) {
                     const std::string k = std::to_string(t.x) + "," + std::to_string(t.y) + "," +
                                           std::to_string(parse_bracket_index(b.slot));
                     const std::string bk = std::to_string(t.x) + "," + std::to_string(t.y) + "," +
@@ -1510,6 +1510,14 @@ struct Spartan3eImpl : ViaductAPI
         return t.in(id_DFF, id_DFFE, id_DFFR, id_DFFS, id_DFFC, id_DFFP, id_DFFRE, id_DFFSE,
                     id_DFFCE, id_DFFPE);
     }
+
+    // T41 P4: accept both the prjcombine bel class (`SLICE`/`IOI`) and the ISE-facing one
+    // emitted by `s3e-tools` (`SLICEM`/`SLICEL`, `IOB__IOI`).
+    static bool is_slice_cls(const std::string &c)
+    {
+        return c == "SLICE" || c == "SLICEM" || c == "SLICEL";
+    }
+    static bool is_ioi_cls(const std::string &c) { return c == "IOI" || c == "IOB__IOI"; }
     IdString getBelBucketForCellType(IdString cell_type) const override
     {
         if (cell_type.in(id_INBUF, id_OUTBUF, id_OBUFT, id_IOBUF))
