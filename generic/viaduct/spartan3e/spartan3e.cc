@@ -1180,7 +1180,12 @@ struct Spartan3eImpl : ViaductAPI
             // T5b：给 INBUF 注入输入 FF 参数，使 s3pack 走与 ISE `rff4` 完全相同（已验证 0/0）
             // 的路径：IOB 侧写 IFD 延时（ISE 输入 FF 默认 `DLY3`）+ IOI 侧写 IFF 配置。
             if (ff->type.in(id_DFF, id_DFFE, id_DFFC, id_DFFP, id_DFFCE, id_DFFPE)) {
-                ib->setParam(ctx->id("IFF1"), Property(std::string("1")));
+                // ISE-native value: the input register is selected with `IFF1::#LATCH`
+                // (bfd's `IFF1` only has `#LATCH`/`#OFF`; the old ad-hoc `"1"` did not
+                // match any value in the ISE model, so the B-form converter could not
+                // map it).  s3pack keys off the *presence* of `IFF1`, so the bits are
+                // unchanged.
+                ib->setParam(ctx->id("IFF1"), Property(std::string("#LATCH")));
                 ib->setParam(ctx->id("ICLK1INV"), Property(std::string("ICLK1")));
                 ib->setParam(ctx->id("IFF1_INIT_ATTR"), Property(std::string("INIT0")));
                 ib->setParam(ctx->id("IFD_DELAY_VALUE"), Property(std::string("DLY3")));
@@ -1442,8 +1447,14 @@ struct Spartan3eImpl : ViaductAPI
             b["z"] = l.z;
             b["type"] = ci->type.str(ctx);
             json11::Json::object params;
-            for (auto &p : ci->params)
-                params[p.first.str(ctx)] = p.second.to_string();
+            for (auto &p : ci->params) {
+                // `Property::to_string()` escapes bit-like *string* values by appending a
+                // space (to disambiguate from a binary string).  The dump is consumed by
+                // s3pack / the ISE converter, which wants the exact ISE value (e.g.
+                // `ISR_USED="0"`, not `"0 "`).  Emit string properties verbatim and
+                // numeric/bit-vector properties as binary.
+                params[p.first.str(ctx)] = p.second.is_string ? p.second.str : p.second.to_string();
+            }
             b["params"] = params;
             // 记录端口→网名：s3pack 用它判断 OUTBUF 的 `I` / INBUF 的 `O` 是否真的接了。
             // 未接/常量驱动的输出 pad（如 multibufg 的 qb[3:1] 被 yosys 折成 x）不能被当成
