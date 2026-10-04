@@ -389,6 +389,17 @@ struct Arch : BaseArch<ArchRanges>
     }
     bool isBelLocationValid(BelId bel, bool explain_invalid = false) const override;
 
+    bool getClusterPlacement(ClusterId cluster, BelId root_bel,
+                             std::vector<std::pair<CellInfo *, BelId>> &placement) const override
+    {
+        if (uarch) {
+            auto result = uarch->getClusterPlacement(cluster, root_bel, placement);
+            if (result.has_value())
+                return *result;
+        }
+        return BaseArch<ArchRanges>::getClusterPlacement(cluster, root_bel, placement);
+    }
+
     static const std::string defaultPlacer;
     static const std::vector<std::string> availablePlacers;
     static const std::string defaultRouter;

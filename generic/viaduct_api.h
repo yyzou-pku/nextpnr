@@ -20,6 +20,10 @@
 #ifndef VIADUCT_API_H
 #define VIADUCT_API_H
 
+#include <optional>
+#include <utility>
+#include <vector>
+
 #include "nextpnr_namespaces.h"
 #include "nextpnr_types.h"
 
@@ -69,6 +73,13 @@ struct ViaductAPI
     virtual BelBucketId getBelBucketForCellType(IdString cell_type) const;
     virtual bool isValidBelForCellType(IdString cell_type, BelId bel) const;
     virtual bool isBelLocationValid(BelId bel, bool explain_invalid = false) const { return true; }
+
+    // Return nullopt to use the generic relative-coordinate cluster placement.
+    virtual std::optional<bool> getClusterPlacement(ClusterId cluster, BelId root_bel,
+                                                    std::vector<std::pair<CellInfo *, BelId>> &placement) const
+    {
+        return std::nullopt;
+    }
 
     // --- Wire and pip functions ---
     // Called when a wire/pip is placed/unplaced (with net=nullptr for a unbind)

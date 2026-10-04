@@ -36,8 +36,12 @@ std::string get_string(std::string str)
 {
     std::string newstr = "\"";
     for (char c : str) {
-        if (c == '\\')
-            newstr += c;
+        if (c == '\\' || c == '"')
+            newstr += '\\';
+        if (static_cast<unsigned char>(c) < 0x20) {
+            newstr += stringf("\\u%04x", static_cast<unsigned char>(c));
+            continue;
+        }
         newstr += c;
     }
     return newstr + "\"";

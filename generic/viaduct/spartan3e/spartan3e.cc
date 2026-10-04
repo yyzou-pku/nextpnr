@@ -26,6 +26,8 @@
 #include "json11.hpp"
 #include "log.h"
 #include "nextpnr.h"
+#include "spartan3e_ise.h"
+#include "spartan3e_ise_db.h"
 #include "util.h"
 #include "viaduct_api.h"
 #include "viaduct_helpers.h"
@@ -1579,11 +1581,27 @@ struct Spartan3eImpl : ViaductAPI
 struct Spartan3eArch : ViaductArch
 {
     Spartan3eArch() : ViaductArch("spartan3e") {};
-    std::unique_ptr<ViaductAPI> create(const dict<std::string, std::string> &args)
+    std::unique_ptr<ViaductAPI> create(const dict<std::string, std::string> &args) override
     {
-        auto impl = std::make_unique<Spartan3eImpl>();
+        std::string db_path;
         if (args.count("db"))
-            impl->db_path = args.at("db");
+            db_path = args.at("db");
+        else if (const char *env = std::getenv("SPARTAN3E_DB"))
+            db_path = env;
+        else
+            db_path = "xc3s500e.json";
+
+        // A spark-ise-chipdb/2 file gets the new load path.  The legacy prjcombine
+        // chipdb keeps the old full uarch until the later stage-3 steps migrate it.
+        if (is_spark_ise_chipdb(db_path)) {
+            if (args.count("pcf"))
+                log_error("spartan3e-ise: use LOC/PACKAGE_PIN attributes; PCF is not implemented\n");
+            return make_spartan3e_ise_impl(db_path, args.count("check_xdl") ? args.at("check_xdl") : "",
+                                         args.count("dump") ? args.at("dump") : "");
+        }
+
+        auto impl = std::make_unique<Spartan3eImpl>();
+        impl->db_path = db_path;
         if (args.count("dump"))
             impl->dump_path = args.at("dump");
         if (args.count("pcf"))
