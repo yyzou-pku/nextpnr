@@ -29,10 +29,13 @@ struct IseClockSite
 // of at most three pips (the native clock-pad entry), never a long fabric detour.
 void index_ise_clock_paths(Context *ctx, std::vector<IseClockSite> &clocks,
                            const std::unordered_map<int32_t, BelId> &pad_wires,
-                           const std::unordered_set<int32_t> &clock_pins, int fabric_wires, int fabric_pips);
+                           const std::unordered_set<int32_t> &clock_pins, int fabric_wires, int fabric_pips,
+                           const std::function<bool(PipId)> &is_distribution);
+
+bool ise_clock_distribution_pip(const std::string &from, const std::string &to);
 
 // Mutable clock packing/routing state is separate from the read-only topology.
-using IseClockPins = std::unordered_map<int32_t, dict<IdString, WireId>>;
+using IseClockPins = std::unordered_map<int32_t, dict<IdString, std::vector<WireId>>>;
 
 class IseClockModel
 {
@@ -59,8 +62,11 @@ class IseClockModel
     std::unordered_map<int, BelId> clock_power_bels;
     IseClockPins physical_clock_pins;
     dict<ClusterId, ClockCluster> clock_cluster;
+    dict<ClusterId, std::vector<CellInfo *>> clock_groups;
     std::vector<PipId> internal_path(WireId source, WireId target,
         const std::function<bool(PipId)> &is_internal, const std::function<bool(PipId)> &available) const;
+    void route_global_outputs(const std::function<bool(PipId)> &is_internal,
+                              const std::function<bool(PipId)> &available);
 };
 
 NEXTPNR_NAMESPACE_END

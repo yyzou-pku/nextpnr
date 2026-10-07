@@ -11,7 +11,8 @@ enum class IseCarryDi
 {
     Zero,
     One,
-    LutInput
+    LutInput,
+    Product
 };
 
 struct IseCarryBit
@@ -20,6 +21,7 @@ struct IseCarryBit
     CellInfo *xorcy = nullptr;
     CellInfo *lut = nullptr;
     CellInfo *ff = nullptr;
+    CellInfo *andcell = nullptr;
     IseCarryDi di = IseCarryDi::Zero;
 };
 

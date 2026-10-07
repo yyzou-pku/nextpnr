@@ -1,6 +1,9 @@
 /* Native clock controller: clustering, region legality, ties and reserved entry routes. */
 #include "spartan3e_ise_clock.h"
 #include "spartan3e_ise_bram.h"
+#include "spartan3e_ise_srl.h"
+#include "spartan3e_ise_ff.h"
+#include "spartan3e_ise_mult.h"
 #include <algorithm>
 #include <set>
 #include "log.h"
@@ -10,15 +13,19 @@
 NEXTPNR_NAMESPACE_BEGIN
 
 namespace {
-bool is_xilinx_ff_cell(IdString type)
+bool is_xilinx_ff_cell(Context *ctx, IdString type)
 {
-    return type.in(id_FD, id_FDCE, id_FDC, id_FDPE, id_FDP, id_FDRE, id_FDSE, id_FDRSE);
+    return ise_ff_shape(type.str(ctx)).has_value();
 }
 
 std::vector<IdString> clock_ports(Context *ctx, CellInfo *cell)
 {
-    if (is_xilinx_ff_cell(cell->type)) return {ctx->id("C")};
-    if (cell->type == ctx->id("RAM16X1S")) return {ctx->id("WCLK")};
+    if (is_xilinx_ff_cell(ctx, cell->type)) return {ctx->id(ise_ff_shape(cell->type.str(ctx))->latch ? "G" : "C")};
+    if (is_ise_srl(ctx, cell->type)) return {ctx->id("CLK")};
+    if (cell->type.in(ctx->id("STARTUP_SPARTAN3E"), ctx->id("CAPTURE_SPARTAN3"))) return {ctx->id("CLK")};
+    if (auto shape = ise_mult_shape(ctx, cell))
+        return shape->clocked() ? std::vector<IdString>{ctx->id(shape->wrapper ? "C" : "CLK")} : std::vector<IdString>{};
+    if (cell->type.in(ctx->id("RAM16X1S"), ctx->id("RAM32X1S"), ctx->id("RAM64X1S"), ctx->id("RAM16X1D"))) return {ctx->id("WCLK")};
     if (auto shape = ise_bram_shape(cell->type.str(ctx)))
         return shape->dual ? std::vector<IdString>{ctx->id("CLKA"), ctx->id("CLKB")} : std::vector<IdString>{ctx->id("CLK")};
     return {};
@@ -35,7 +42,7 @@ IseClockModel::IseClockModel(Context *context, const IseChipDb &database, std::v
 
 bool IseClockModel::pip_available(PipId pip, const NetInfo *net) const
 {
-    if (net->driver.cell != nullptr && net->driver.cell->type.in(id_BUFG, id_BUFGMUX)) {
+    if (net->driver.cell != nullptr && net->driver.cell->type.in(id_BUFG, id_BUFGMUX, ctx->id("BUFGMUX_1"))) {
         const auto &clock = clock_sites.at(clock_bel_index.at(net->driver.cell->bel.index));
         return clock.global_pips.count(pip.index) != 0;
     }
@@ -46,7 +53,12 @@ void IseClockModel::pack()
 {
     for (auto &entry : ctx->cells) {
         CellInfo *cell = entry.second.get();
-        if (!cell->type.in(id_BUFG, id_BUFGMUX)) continue;
+        if (!cell->type.in(id_BUFG, id_BUFGMUX, ctx->id("BUFGMUX_1"))) continue;
+        if (cell->type != id_BUFG)
+            for (const auto &parameter : cell->params)
+                if (parameter.first != ctx->id("CLK_SEL_TYPE") || !parameter.second.is_string ||
+                    parameter.second.as_string() != "SYNC")
+                    log_error("spartan3e-ise: BUFGMUX/BUFGMUX_1 currently requires CLK_SEL_TYPE=SYNC\n");
         ClockCluster cluster;
         cluster.root = cell;
         auto loc = cell->attrs.find(ctx->id("LOC"));
@@ -89,17 +101,63 @@ void IseClockModel::pack()
                     if (std::find(ports.begin(), ports.end(), user.port) == ports.end())
                         log_error("spartan3e-ise: global clock %s has an unsupported clock sink\n", ctx->nameOf(cell));
             }
-        for (auto *member : {cell, cluster.pads[0], cluster.pads[1]}) {
-            if (member == nullptr) continue;
+        clock_cluster[cell->name] = cluster;
+    }
+    // A pad is a single physical cell even when it feeds several global
+    // buffers. Cluster the connected component, not each buffer separately.
+    std::vector<CellInfo *> buffers;
+    std::map<CellInfo *, std::vector<CellInfo *>> pad_users;
+    for (const auto &entry : clock_cluster) {
+        buffers.push_back(entry.second.root);
+        for (CellInfo *pad : entry.second.pads)
+            if (pad != nullptr) pad_users[pad].push_back(entry.second.root);
+    }
+    std::sort(buffers.begin(), buffers.end(), [&](CellInfo *a, CellInfo *b) {
+        return a->name.str(ctx) < b->name.str(ctx);
+    });
+    std::set<CellInfo *> seen;
+    for (CellInfo *root : buffers) {
+        if (!seen.insert(root).second) continue;
+        std::vector<CellInfo *> group{root};
+        for (size_t head = 0; head < group.size(); ++head)
+            for (CellInfo *pad : clock_cluster.at(group[head]->name).pads)
+                if (pad != nullptr)
+                    for (CellInfo *buffer : pad_users.at(pad))
+                        if (seen.insert(buffer).second) group.push_back(buffer);
+        std::sort(group.begin() + 1, group.end(), [&](CellInfo *a, CellInfo *b) {
+            return a->name.str(ctx) < b->name.str(ctx);
+        });
+        std::set<CellInfo *> members;
+        auto add = [&](CellInfo *member) {
+            if (member == nullptr || !members.insert(member).second) return;
             if (member->cluster != ClusterId())
-                log_error("spartan3e-ise: shared clock input needs a multi-buffer cluster: %s\n", ctx->nameOf(member));
-            member->cluster = cell->name;
+                log_error("spartan3e-ise: clock member already belongs to a different cluster: %s\n", ctx->nameOf(member));
+            member->cluster = root->name;
             member->constr_x = 0;
             member->constr_y = 0;
             member->constr_abs_z = false;
-            if (member != cell) cell->constr_children.push_back(member);
+            if (member != root) root->constr_children.push_back(member);
+        };
+        for (CellInfo *buffer : group) {
+            add(buffer);
+            for (CellInfo *pad : clock_cluster.at(buffer->name).pads) add(pad);
         }
-        clock_cluster[cell->name] = cluster;
+        clock_groups[root->name] = group;
+        bool feasible = false;
+        std::vector<std::pair<CellInfo *, BelId>> placement;
+        for (const auto &site : clock_sites)
+            if (get_cluster_placement(root->name, site.bel, placement).value_or(false)) {
+                feasible = true;
+                break;
+            }
+        if (!feasible)
+            log_error("spartan3e-ise: shared clock cluster has no joint dedicated pad/BUF placement: %s\n", ctx->nameOf(root));
+        // HeAP skips a cluster whose root is already placed by a BEL/LOC
+        // constraint. Freeze its complete graph-derived assignment as well;
+        // leaving the shared pads/partner buffers movable loses the cluster.
+        if (root->attrs.count(ctx->id("BEL")))
+            for (const auto &member : placement)
+                member.first->attrs[ctx->id("BEL")] = Property(ctx->getBelName(member.second).str(ctx));
     }
 }
 
@@ -131,18 +189,20 @@ void IseClockModel::add_ties()
 bool IseClockModel::region_valid(CellInfo *cell, BelId bel) const
 {
     auto clk_pin = [&](BelId target, IdString port) { return physical_clock_pins.at(target.index).at(port); };
-    if (cell->type.in(id_BUFG, id_BUFGMUX)) {
+    if (cell->type.in(id_BUFG, id_BUFGMUX, ctx->id("BUFGMUX_1"))) {
         const auto &clock = clock_sites.at(clock_bel_index.at(bel.index));
         if (auto *out = cell->getPort(id_O))
             for (const auto &user : out->users)
-                if (user.cell->bel != BelId() && !clock.global_wires.count(clk_pin(user.cell->bel, user.port).index))
-                    return false;
+                if (user.cell->bel != BelId())
+                    for (WireId pin : clk_pin(user.cell->bel, user.port))
+                        if (!clock.global_wires.count(pin.index)) return false;
     } else for (IdString port : clock_ports(ctx, cell)) {
         NetInfo *net = cell->getPort(port);
-        if (net != nullptr && net->driver.cell != nullptr && net->driver.cell->type.in(id_BUFG, id_BUFGMUX) &&
+        if (net != nullptr && net->driver.cell != nullptr && net->driver.cell->type.in(id_BUFG, id_BUFGMUX, ctx->id("BUFGMUX_1")) &&
             net->driver.cell->bel != BelId()) {
             const auto &clock = clock_sites.at(clock_bel_index.at(net->driver.cell->bel.index));
-            if (!clock.global_wires.count(clk_pin(bel, port).index)) return false;
+            for (WireId pin : clk_pin(bel, port))
+                if (!clock.global_wires.count(pin.index)) return false;
         }
     }
     return true;
@@ -202,38 +262,131 @@ void IseClockModel::pre_route(const std::function<bool(PipId)> &is_internal, con
             }
         }
     }
+    route_global_outputs(is_internal, available);
+}
+
+void IseClockModel::route_global_outputs(const std::function<bool(PipId)> &is_internal,
+                                        const std::function<bool(PipId)> &available)
+{
+    std::vector<CellInfo *> buffers;
+    for (const auto &entry : clock_cluster) buffers.push_back(entry.second.root);
+    std::sort(buffers.begin(), buffers.end(), [&](CellInfo *a, CellInfo *b) {
+        return a->name.str(ctx) < b->name.str(ctx);
+    });
+    size_t sinks = 0, locked = 0;
+    for (CellInfo *buffer : buffers) {
+        NetInfo *net = buffer->getPort(id_O);
+        if (net == nullptr) log_error("spartan3e-ise: global buffer has no output net\n");
+        const auto &clock = clock_sites.at(clock_bel_index.at(buffer->bel.index));
+        WireId source = ctx->getNetinfoSourceWire(net);
+        std::vector<WireId> targets;
+        for (const auto &user : net->users)
+            for (WireId wire : ctx->getNetinfoSinkWires(net, user)) targets.push_back(wire);
+        std::vector<WireId> queue{source};
+        std::unordered_set<int32_t> seen{source.index};
+        std::unordered_map<int32_t, PipId> previous;
+        for (size_t head = 0; head < queue.size(); ++head) {
+            for (PipId pip : ctx->getPipsDownhill(queue[head])) {
+                if ((!is_internal(pip) && !clock.global_pips.count(pip.index)) || !available(pip)) continue;
+                WireId to = ctx->getPipDstWire(pip);
+                auto *pip_owner = ctx->getBoundPipNet(pip);
+                auto *wire_owner = ctx->getBoundWireNet(to);
+                if ((pip_owner != nullptr && pip_owner != net) || (wire_owner != nullptr && wire_owner != net)) continue;
+                if (!seen.insert(to.index).second) continue;
+                previous[to.index] = pip;
+                queue.push_back(to);
+            }
+        }
+        std::vector<PipId> tree;
+        std::unordered_set<int32_t> included;
+        for (WireId target : targets) {
+            if (!seen.count(target.index))
+                log_error("spartan3e-ise: dedicated clock routing cannot reach sink on %s (resource conflict or region); no fabric fallback\n", ctx->nameOf(net));
+            for (WireId wire = target; wire != source;) {
+                PipId pip = previous.at(wire.index);
+                if (!included.insert(pip.index).second) break;
+                wire = ctx->getPipSrcWire(pip);
+            }
+        }
+        auto *owner = ctx->getBoundWireNet(source);
+        if (owner != nullptr && owner != net) log_error("spartan3e-ise: dedicated clock source is occupied\n");
+        if (owner == nullptr) ctx->bindWire(source, net, STRENGTH_LOCKED);
+        // Each target path follows one BFS parent tree. Bind root-to-leaf so
+        // the generic router receives a complete, immutable clock network.
+        for (WireId wire : queue) {
+            if (wire == source) continue;
+            PipId pip = previous.at(wire.index);
+            if (included.count(pip.index)) tree.push_back(pip);
+        }
+        for (PipId pip : tree) {
+            if (ctx->getBoundPipNet(pip) == net) continue;
+            ctx->bindPip(pip, net, STRENGTH_LOCKED);
+            ++locked;
+        }
+        sinks += targets.size();
+    }
+    log_info("Spartan-3E ISE: dedicated clock routing locked %zu pips for %zu sinks in %zu networks before fabric routing\n", locked, sinks, buffers.size());
 }
 
 std::optional<bool> IseClockModel::get_cluster_placement(ClusterId cluster, BelId root_bel,
     std::vector<std::pair<CellInfo *, BelId>> &placement) const
 {
-    auto clock = clock_cluster.find(cluster);
-    if (clock != clock_cluster.end()) {
-        auto candidate = clock_bel_index.find(root_bel.index);
-        if (candidate == clock_bel_index.end()) return false;
-        const auto &site = clock_sites[candidate->second];
-        if (!region_valid(clock->second.root, root_bel)) return false;
-        placement.clear();
-        placement.emplace_back(clock->second.root, root_bel);
-        std::set<int32_t> used;
-        for (int input = 0; input < 2; ++input) {
-            CellInfo *pad = clock->second.pads[input];
-            if (pad == nullptr) continue;
-            BelId chosen;
-            auto fixed = pad->attrs.find(ctx->id("BEL"));
-            for (const auto &path : site.pad_paths[input]) {
-                BelId bel{path.first};
-                if (used.count(bel.index)) continue;
-                if (fixed != pad->attrs.end() && ctx->getBelByNameStr(fixed->second.as_string()) != bel) continue;
-                if (chosen == BelId() || bel.index < chosen.index) chosen = bel;
-            }
-            if (chosen == BelId()) return false;
-            used.insert(chosen.index);
-            placement.emplace_back(pad, chosen);
+    auto group = clock_groups.find(cluster);
+    if (group == clock_groups.end()) return std::nullopt;
+    placement.clear();
+    std::map<CellInfo *, BelId> assigned;
+    std::set<int32_t> used;
+    auto fixed_matches = [&](CellInfo *cell, BelId bel) {
+        auto fixed = cell->attrs.find(ctx->id("BEL"));
+        return fixed == cell->attrs.end() || ctx->getBelByNameStr(fixed->second.as_string()) == bel;
+    };
+    // Backtrack over the small dedicated clock/pad graph. Shared pads must
+    // satisfy every buffer's input path; no coordinate or BEL-name inference.
+    std::function<bool(size_t)> assign_buffer;
+    assign_buffer = [&](size_t index) {
+        if (index == group->second.size()) return true;
+        CellInfo *buffer = group->second[index];
+        const auto &info = clock_cluster.at(buffer->name);
+        for (const auto &site : clock_sites) {
+            if ((index == 0 && site.bel != root_bel) || used.count(site.bel.index) ||
+                !fixed_matches(buffer, site.bel) || !region_valid(buffer, site.bel)) continue;
+            assigned[buffer] = site.bel;
+            used.insert(site.bel.index);
+            std::function<bool(int)> assign_pad = [&](int input) {
+                if (input == 2) return assign_buffer(index + 1);
+                CellInfo *pad = info.pads[input];
+                if (pad == nullptr) return assign_pad(input + 1);
+                auto existing = assigned.find(pad);
+                if (existing != assigned.end())
+                    return site.pad_paths[input].count(existing->second.index) && assign_pad(input + 1);
+                std::vector<int32_t> candidates;
+                for (const auto &path : site.pad_paths[input]) candidates.push_back(path.first);
+                std::sort(candidates.begin(), candidates.end());
+                for (int32_t candidate : candidates) {
+                    BelId bel{candidate};
+                    if (used.count(candidate) || !fixed_matches(pad, bel)) continue;
+                    assigned[pad] = bel;
+                    used.insert(candidate);
+                    if (assign_pad(input + 1)) return true;
+                    used.erase(candidate);
+                    assigned.erase(pad);
+                }
+                return false;
+            };
+            if (assign_pad(0)) return true;
+            used.erase(site.bel.index);
+            assigned.erase(buffer);
         }
-        return true;
+        return false;
+    };
+    if (!assign_buffer(0)) return false;
+    std::set<CellInfo *> emitted;
+    for (CellInfo *buffer : group->second) {
+        placement.emplace_back(buffer, assigned.at(buffer));
+        for (CellInfo *pad : clock_cluster.at(buffer->name).pads)
+            if (pad != nullptr && emitted.insert(pad).second) placement.emplace_back(pad, assigned.at(pad));
     }
-    return std::nullopt;
+    return true;
 }
 
 NEXTPNR_NAMESPACE_END

@@ -33,6 +33,10 @@
 #include "spartan3e_ise_wide.h"
 #include "spartan3e_ise_clock.h"
 #include "spartan3e_ise_bram.h"
+#include "spartan3e_ise_lutram.h"
+#include "spartan3e_ise_srl.h"
+#include "spartan3e_ise_ff.h"
+#include "spartan3e_ise_mult.h"
 #include "spartan3e_ise_db.h"
 #include "spartan3e_xdl.h"
 #include "viaduct_api.h"
@@ -109,7 +113,14 @@ struct IseSiteRouteMeta
 struct CarrySite
 {
     IseSiteRef site;
-    std::array<BelId, 2> lut, ff, mux, xorcy;
+    std::array<BelId, 2> lut, ff, mux, xorcy, andcell;
+    int next = -1;
+};
+
+struct MultSite
+{
+    IseSiteRef site;
+    BelId bel;
     int next = -1;
 };
 
@@ -164,11 +175,19 @@ struct Spartan3eIseImpl : ViaductAPI
     std::unordered_map<int32_t, std::string> bel_package_pin;
     std::unordered_map<int32_t, BelId> iob_off_bels;
     dict<ClusterId, CellInfo *> iob_off_clusters;
+    std::unordered_map<int32_t, BelId> iob_tff_bels;
+    dict<ClusterId, CellInfo *> iob_tff_clusters;
     std::unordered_map<int32_t, BelId> iob_if_bels;
     dict<ClusterId, CellInfo *> iob_if_clusters;
     // Diagnostic route provenance; no parsing of displayed pip names.
     std::unordered_map<int32_t, IseSiteRouteMeta> site_route_meta;
     std::vector<CarrySite> carry_sites;
+    std::vector<IseRam32Resources> ram32_resources;
+    std::unordered_map<int32_t, size_t> ram32_resource_by_bel;
+    std::vector<IseRam16DualResources> ram16_dual_resources;
+    std::unordered_map<int32_t, size_t> ram16_dual_resource_by_bel;
+    std::vector<IseRam64Resources> ram64_resources;
+    std::unordered_map<int32_t, size_t> ram64_by_bel;
     std::unordered_map<int32_t, std::pair<int, int>> carry_bel_slot;
     std::vector<IseCarryChain> carry_chains;
     dict<ClusterId, size_t> carry_cluster;
@@ -179,6 +198,13 @@ struct Spartan3eIseImpl : ViaductAPI
     std::vector<std::array<std::array<int, 2>, 2>> wide_sources;
     std::vector<IseWideTree> wide_trees;
     dict<ClusterId, size_t> wide_cluster;
+    std::vector<int> srl_next_site;
+    std::vector<IseSrlChain> srl_chains;
+    dict<ClusterId, size_t> srl_cluster;
+    std::vector<MultSite> mult_sites;
+    std::unordered_map<int32_t, int> mult_site_by_bel;
+    std::vector<IseMultChain> mult_chains;
+    dict<ClusterId, size_t> mult_cluster;
     std::vector<IseClockSite> clock_sites;
     std::unordered_map<int, BelId> clock_power_bels;
     std::unique_ptr<IseClockModel> clock_model;
@@ -206,6 +232,9 @@ struct Spartan3eIseImpl : ViaductAPI
         init_bels();
         index_carry_topology();
         index_wide_topology();
+        index_srl_topology();
+        index_mult_topology();
+        init_ram64_bels();
         index_clock_topology();
         if (!check_xdl_path.empty())
             check_xdl_routing(ctx, db, tile_base, member_wire, site_by_name, check_xdl_path);
@@ -265,21 +294,31 @@ struct Spartan3eIseImpl : ViaductAPI
                 "F",      "G",      "FFX",      "FFY",    "FXMUX",  "GYMUX", "DXMUX",  "DYMUX",
                 "XUSED",  "YUSED",  "CLKINV",   "CEINV",  "SRINV",  "BXINV", "BYINV",  "XORF",
                 "XORG",   "FAND",   "GAND",     "CYINIT", "CY0F",   "CY0G",  "CYSELF", "CYSELG",
-                "CYMUXF", "CYMUXG", "COUTUSED", "XBUSED", "YBUSED", "XBMUX", "YBMUX",  "SRFFMUX",
+                "CYMUXF", "CYMUXG", "COUTUSED", "XBUSED", "YBUSED", "XBMUX", "YBMUX", "SRFFMUX", "REVUSED",
                 "F5MUX", "F6MUX", "F5USED", "FXUSED",
-                "DIF_MUX", "DIG_MUX", "WSGEN",
+                "DIF_MUX", "DIG_MUX", "WSGEN", "SLICEWE0USED", "SLICEWE1USED",
+                "BYOUTUSED", "BYINVOUTUSED", "DIGUSED", "SHIFTIN", "SHIFTOUT", "SHIFTOUTUSED",
+                "FMC15_BLACKBOX", "GMC15_BLACKBOX",
                 "WF1USED", "WF2USED", "WF3USED", "WF4USED", "WG1USED", "WG2USED", "WG3USED", "WG4USED",
         };
-        static const std::set<std::string> io_selected = {"INBUF", "IDELMUX", "IMUX", "O1INV", "OMUX", "OUTBUF", "T1INV", "TMUX", "OFF1", "O1_DDRMUX", "OTCLK1INV", "OCEINV", "PCICE_MUX", "SRINV", "OSR_USED", "IFF1", "IFFDELMUX", "IFFDMUX", "IDDRIN_MUX", "ICLK1INV", "ICEINV", "ISR_USED"};
+        static const std::set<std::string> io_selected = {"INBUF", "IDELMUX", "IMUX", "O1INV", "OMUX", "OUTBUF", "T1INV", "TMUX", "TFF1", "TCEINV", "TSR_USED", "OFF1", "O1_DDRMUX", "OTCLK1INV", "OCEINV", "PCICE_MUX", "SRINV", "OSR_USED", "IFF1", "IFFDELMUX", "IFFDMUX", "IDDRIN_MUX", "ICLK1INV", "ICEINV", "ISR_USED"};
         static const std::set<std::string> clock_selected = {"I0_USED", "I1_USED", "SINV", "GCLKMUX", "GCLK_BUFFER"};
         static const std::set<std::string> power_selected = {"POWER"};
         static const std::set<std::string> bram_selected = {"RAMB16", "RAMB16A", "RAMB16B", "CLKAINV", "CLKBINV",
                 "ENAINV", "ENBINV", "WEAINV", "WEBINV", "SSRAINV", "SSRBINV"};
+        static const std::set<std::string> mult_selected = {"MULT18X18SIO", "CLKINV", "CEAINV", "CEBINV",
+                "CEPINV", "RSTAINV", "RSTBINV", "RSTPINV"};
+        static const std::set<std::string> startup_selected = {"STARTUP", "CLKINV", "GTSINV", "GSRINV", "CLK", "GSR", "GTS", "MBT"};
+        static const std::set<std::string> capture_selected = {"CAPTURE_BLACKBOX", "CLKINV", "CAPINV", "ONESHOT_ATTR", "CLK", "CAP"};
+        static const std::set<std::string> bscan_selected = {"BSCAN_BLACKBOX", "TDO1", "TDO2", "SEL1", "SEL2", "TDI",
+                "SHIFT", "UPDATE", "DRCK1", "DRCK2", "RESET", "CAPTURE"};
         // Logic BELs compute their outputs; they are not routing multiplexers.
         static const std::set<std::string> no_internal_pips = {"F",      "G",    "FFX",  "FFY",  "CYMUXF",
                                                                "CYMUXG", "XORF", "XORG", "FAND", "GAND", "F5MUX", "F6MUX",
                                                                "GCLKMUX", "GCLK_BUFFER", "POWER", "WSGEN",
-                                                               "RAMB16", "RAMB16A", "RAMB16B"};
+                                                               "FMC15_BLACKBOX", "GMC15_BLACKBOX",
+                                                               "RAMB16", "RAMB16A", "RAMB16B", "MULT18X18SIO",
+                                                               "STARTUP", "CAPTURE_BLACKBOX", "BSCAN_BLACKBOX"};
         if (site_graph_built)
             return;
         site_graph_built = true;
@@ -296,10 +335,14 @@ struct Spartan3eIseImpl : ViaductAPI
             {
                 const auto &site = variant.sites[si];
                 bool io = is_io_site_type(site.type);
-                if (site.type != "SLICEL" && site.type != "SLICEM" && !io && site.type != "BUFGMUX" && site.type != "VCC" && site.type != "RAMB16")
+                if (site.type != "SLICEL" && site.type != "SLICEM" && !io && site.type != "BUFGMUX" && site.type != "VCC" &&
+                    site.type != "RAMB16" && site.type != "MULT18X18SIO" && site.type != "STARTUP" && site.type != "CAPTURE" && site.type != "BSCAN")
                     continue;
                 const auto &selected = io ? io_selected : site.type == "BUFGMUX" ? clock_selected :
-                                       site.type == "VCC" ? power_selected : site.type == "RAMB16" ? bram_selected : clb_selected;
+                                       site.type == "VCC" ? power_selected : site.type == "RAMB16" ? bram_selected :
+                                       site.type == "MULT18X18SIO" ? mult_selected :
+                                       site.type == "STARTUP" ? startup_selected : site.type == "CAPTURE" ? capture_selected :
+                                       site.type == "BSCAN" ? bscan_selected : clb_selected;
                 auto st_it = db.site_defs.find(site.type);
                 if (st_it == db.site_defs.end())
                     log_error("spartan3e-ise: missing site_defs for %s\n", site.type.c_str());
@@ -478,6 +521,10 @@ struct Spartan3eIseImpl : ViaductAPI
             ctx->addBelInput(bel, id_D, site_elem_wire(ti, si, element, "DI"));
             ctx->addBelInput(bel, ctx->id("WCLK"), site_elem_wire(ti, si, "WSGEN", "CK"));
             ctx->addBelInput(bel, ctx->id("WE"), site_elem_wire(ti, si, "WSGEN", "WE"));
+            ctx->addBelInput(bel, ctx->id("CLK"), site_elem_wire(ti, si, "WSGEN", "CK"));
+            ctx->addBelInput(bel, id_CE, site_elem_wire(ti, si, "WSGEN", "WE"));
+            ctx->addBelOutput(bel, id_Q, site_elem_wire(ti, si, element, "D"));
+            ctx->addBelOutput(bel, ctx->id("Q15"), site_elem_wire(ti, si, element + "MC15_BLACKBOX", "MC15"));
         }
         WireId out = site_elem_wire(ti, si, element, "D");
         if (out != WireId())
@@ -489,7 +536,7 @@ struct Spartan3eIseImpl : ViaductAPI
                      const std::string &element, int z)
     {
         IdStringList name = h.xy_id(tile.col, tile.row, IdStringList::concat(ctx->id(site_name), ctx->id(element)));
-        BelId bel = ctx->addBel(name, element == "OFF1" ? ctx->id("IOB_OFF1") : element == "IFF1" ? ctx->id("IOB_IFF1") : id_DFF, Loc(tile.col, tile.row, z), false, false);
+        BelId bel = ctx->addBel(name, element == "OFF1" ? ctx->id("IOB_OFF1") : element == "IFF1" ? ctx->id("IOB_IFF1") : element == "TFF1" ? ctx->id("IOB_TFF1") : id_DFF, Loc(tile.col, tile.row, z), false, false);
         bel_site_info[bel.index] = BelSiteInfo{IseSiteRef{(int)ti, (int)si}, element};
         WireId d = site_elem_wire(ti, si, element, "D");
         if (d != WireId())
@@ -506,6 +553,10 @@ struct Spartan3eIseImpl : ViaductAPI
             ctx->addBelInput(bel, id_S, sr);
             ctx->addBelInput(bel, ctx->id("CLR"), sr);
             ctx->addBelInput(bel, ctx->id("PRE"), sr);
+        }
+        if (element == "FFX" || element == "FFY") {
+            ctx->addBelInput(bel, ctx->id("REV_R"), site_elem_wire(ti, si, element, "REV"));
+            ctx->addBelInput(bel, ctx->id("REV_S"), site_elem_wire(ti, si, element, "REV"));
         }
         WireId q = site_elem_wire(ti, si, element, "Q");
         if (q != WireId())
@@ -603,14 +654,55 @@ struct Spartan3eIseImpl : ViaductAPI
                         ctx->addBelOutput(bel, id_O, site_elem_wire(ti, si, element, "OUT"));
                     }
                     wide_bels.push_back(wide);
+                    for (int half = 0; half < 2; ++half) {
+                        const std::string element = half == 0 ? "FAND" : "GAND";
+                        BelId bel = ctx->addBel(h.xy_id(tile.col, tile.row,
+                            IdStringList::concat(ctx->id(site_name), ctx->id(element))), ctx->id("MULT_AND"),
+                            Loc(tile.col, tile.row, z + (site.type == "SLICEM" ? 8 : 6) + half), false, false);
+                        carry.andcell[half] = bel;
+                        bel_site_info[bel.index] = BelSiteInfo{IseSiteRef{int(ti), int(si)}, element};
+                        ctx->addBelInput(bel, id_I0, site_elem_wire(ti, si, element, "0"));
+                        ctx->addBelInput(bel, id_I1, site_elem_wire(ti, si, element, "1"));
+                        ctx->addBelOutput(bel, ctx->id("LO"), site_elem_wire(ti, si, element, "O"));
+                    }
+                    if (site.type == "SLICEM") {
+                        BelId composite = ctx->addBel(h.xy_id(tile.col, tile.row,
+                            IdStringList::concat(ctx->id(site_name), ctx->id("RAM32"))), ctx->id("RAM32X1S"),
+                            Loc(tile.col, tile.row, z + 6), false, false);
+                        bel_site_info[composite.index] = BelSiteInfo{IseSiteRef{int(ti), int(si)}, "F5MUX"};
+                        connect_ise_ram32(ctx, composite, [&](const std::string &element, const std::string &pin) {
+                            return site_elem_wire(ti, si, element, pin);
+                        });
+                        IseRam32Resources resources{composite, {carry.lut[0], carry.lut[1],
+                            bels[0], bels[1], bels[2], bels[3], wide[0], wide[1], carry.andcell[0], carry.andcell[1]}, carry.ff};
+                        BelId dual = ctx->addBel(h.xy_id(tile.col, tile.row,
+                            IdStringList::concat(ctx->id(site_name), ctx->id("RAM16D"))), ctx->id("RAM16X1D"),
+                            Loc(tile.col, tile.row, z + 7), false, false);
+                        bel_site_info[dual.index] = BelSiteInfo{IseSiteRef{int(ti), int(si)}, "F"};
+                        connect_ise_ram16_dual(ctx, dual, [&](const std::string &element, const std::string &pin) {
+                            return site_elem_wire(ti, si, element, pin);
+                        });
+                        IseRam16DualResources dual_resources{dual, resources.members};
+                        dual_resources.excluded.push_back(composite);
+                        for (BelId ff : carry.ff) dual_resources.excluded.push_back(ff);
+                        ram16_dual_resource_by_bel[dual.index] = ram16_dual_resources.size();
+                        for (BelId member : dual_resources.excluded)
+                            ram16_dual_resource_by_bel[member.index] = ram16_dual_resources.size();
+                        ram16_dual_resources.push_back(std::move(dual_resources));
+                        resources.members.push_back(dual);
+                        ram32_resource_by_bel[composite.index] = ram32_resources.size();
+                        for (BelId member : resources.members) ram32_resource_by_bel[member.index] = ram32_resources.size();
+                        for (BelId ff : resources.ffs) ram32_resource_by_bel[ff.index] = ram32_resources.size();
+                        ram32_resources.push_back(std::move(resources));
+                    }
                     for (int half = 0; half < 2; half++) {
                         carry.mux[half] = bels[2 * half];
                         carry.xorcy[half] = bels[2 * half + 1];
-                        for (auto bel : {carry.lut[half], carry.ff[half], carry.mux[half], carry.xorcy[half]})
+                        for (auto bel : {carry.lut[half], carry.ff[half], carry.mux[half], carry.xorcy[half], carry.andcell[half]})
                             carry_bel_slot[bel.index] = {int(carry_sites.size()), half};
                     }
                     carry_sites.push_back(carry);
-                    z += 6; // Carry and wide mux resources are separate BELs.
+                    z += site.type == "SLICEM" ? 10 : 8; // Includes memory composites and both product BELs.
                     nlut += 2;
                     nff += 2;
                 } else if (is_io_site_type(site.type) && si < tile.bonding.size() && tile.bonding[si] == "bonded") {
@@ -620,13 +712,32 @@ struct Spartan3eIseImpl : ViaductAPI
                     if (site_elem_index.at(site.type).count("OUTBUF")) {
                         BelId ff = add_ff_bel(tile, ti, si, site_name, "OFF1", z++);
                         iob_off_bels[pad.index] = ff;
+                        if (site_elem_index.at(site.type).count("TFF1"))
+                            iob_tff_bels[pad.index] = add_ff_bel(tile, ti, si, site_name, "TFF1", z++);
                     }
                     nio++;
                 } else if (site.type == "RAMB16") {
                     add_bram_bel(tile, int(ti), int(si), site_name, z++);
+                } else if (site.type == "MULT18X18SIO") {
+                    BelId bel = ctx->addBel(h.xy_id(tile.col, tile.row,
+                        IdStringList::concat(ctx->id(site_name), ctx->id("MULT18X18SIO"))), ctx->id("MULT18X18SIO"),
+                        Loc(tile.col, tile.row, z++), false, false);
+                    bel_site_info[bel.index] = BelSiteInfo{IseSiteRef{int(ti), int(si)}, "MULT18X18SIO"};
+                    mult_site_by_bel[bel.index] = int(mult_sites.size());
+                    mult_sites.push_back({IseSiteRef{int(ti), int(si)}, bel, -1});
+                    const auto &elements = db.site_defs.at("MULT18X18SIO").elements;
+                    auto multiplier = std::find_if(elements.begin(), elements.end(), [](const auto &element) {
+                        return element.name == "MULT18X18SIO";
+                    });
+                    if (multiplier == elements.end()) log_error("spartan3e-ise: missing multiplier site element\n");
+                    for (const auto &pin : multiplier->pins) {
+                        WireId wire = site_elem_wire(ti, si, multiplier->name, pin.first);
+                        if (pin.second == "input") ctx->addBelInput(bel, ctx->id(pin.first), wire);
+                        else ctx->addBelOutput(bel, ctx->id(pin.first), wire);
+                    }
                 } else if (site.type == "BUFGMUX") {
                     BelId bel = ctx->addBel(h.xy_id(tile.col, tile.row, IdStringList::concat(ctx->id(site_name), ctx->id("GCLK_BUFFER"))),
-                                           id_BUFGMUX, Loc(tile.col, tile.row, z++), false, true);
+                                           id_BUFGMUX, Loc(tile.col, tile.row, z++), true, true);
                     IseSiteRef ref{int(ti), int(si)};
                     bel_site_info[bel.index] = BelSiteInfo{ref, "GCLK_BUFFER"};
                     ctx->addBelInput(bel, id_I, site_elem_wire(ti, si, "GCLKMUX", "I0"));
@@ -646,6 +757,28 @@ struct Spartan3eIseImpl : ViaductAPI
                     bel_site_info[bel.index] = BelSiteInfo{IseSiteRef{int(ti), int(si)}, "POWER"};
                     ctx->addBelOutput(bel, ctx->id("P"), site_elem_wire(ti, si, "POWER", "1"));
                     clock_power_bels[int(ti)] = bel;
+                } else if (site.type == "STARTUP" || site.type == "CAPTURE" || site.type == "BSCAN") {
+                    // Fixed single-site control primitives; the BEL is the site's
+                    // blackbox element and the pins route through the corner muxes.
+                    const std::string element = site.type == "STARTUP" ? "STARTUP" :
+                                                site.type == "CAPTURE" ? "CAPTURE_BLACKBOX" : "BSCAN_BLACKBOX";
+                    const IseSiteElement *bel_elem = nullptr;
+                    for (const auto &candidate : db.site_defs.at(site.type).elements)
+                        if (candidate.name == element)
+                            bel_elem = &candidate;
+                    if (bel_elem == nullptr)
+                        log_error("spartan3e-ise: %s site has no %s element\n", site.type.c_str(), element.c_str());
+                    BelId bel = ctx->addBel(h.xy_id(tile.col, tile.row,
+                                                   IdStringList::concat(ctx->id(site_name), ctx->id(site.type))),
+                                           ctx->id(site.type), Loc(tile.col, tile.row, z++), false, false);
+                    bel_site_info[bel.index] = BelSiteInfo{IseSiteRef{int(ti), int(si)}, element};
+                    for (const auto &pin : bel_elem->pins) {
+                        WireId w = site_elem_wire(ti, si, element, pin.first);
+                        if (pin.second == "input")
+                            ctx->addBelInput(bel, ctx->id(pin.first), w);
+                        else if (pin.second == "output")
+                            ctx->addBelOutput(bel, ctx->id(pin.first), w);
+                    }
                 }
             }
         }
@@ -698,17 +831,46 @@ struct Spartan3eIseImpl : ViaductAPI
             const auto &def = db.variants[tile.variant].sites[carry.site.site];
             WireId pin = site_pin_wire(tile, carry.site.tile, def, "CLK");
             pins.insert(pin.index);
-            for (BelId bel : carry.ff) physical_clock_pins[bel.index][ctx->id("C")] = pin;
-            for (BelId bel : carry.lut) physical_clock_pins[bel.index][ctx->id("WCLK")] = pin;
+            for (BelId bel : carry.ff) {
+                physical_clock_pins[bel.index][ctx->id("C")] = {pin};
+                physical_clock_pins[bel.index][ctx->id("G")] = {pin};
+            }
+            for (BelId bel : carry.lut) physical_clock_pins[bel.index][ctx->id("WCLK")] = {pin};
+            for (BelId bel : carry.lut) physical_clock_pins[bel.index][ctx->id("CLK")] = {pin};
         }
         for (const auto &entry : bel_site_info) {
-            if (entry.second.element == "OFF1" || entry.second.element == "IFF1") {
+            if (ctx->getBelType(BelId{entry.first}).in(ctx->id("RAM32X1S"), ctx->id("RAM16X1D"))) {
                 const auto &ref = entry.second.site;
                 const auto &tile = db.tiles[ref.tile];
                 const auto &site = db.variants[tile.variant].sites[ref.site];
-                WireId pin = site_pin_wire(tile, ref.tile, site, entry.second.element == "OFF1" ? "OTCLK1" : "ICLK1");
+                WireId pin = site_pin_wire(tile, ref.tile, site, "CLK");
                 pins.insert(pin.index);
-                physical_clock_pins[entry.first][ctx->id("C")] = pin;
+                physical_clock_pins[entry.first][ctx->id("WCLK")] = {pin};
+            }
+            if (entry.second.element == "OFF1" || entry.second.element == "IFF1" || entry.second.element == "TFF1") {
+                const auto &ref = entry.second.site;
+                const auto &tile = db.tiles[ref.tile];
+                const auto &site = db.variants[tile.variant].sites[ref.site];
+                WireId pin = site_pin_wire(tile, ref.tile, site, entry.second.element == "IFF1" ? "ICLK1" : "OTCLK1");
+                pins.insert(pin.index);
+                physical_clock_pins[entry.first][ctx->id("C")] = {pin};
+            }
+            if (entry.second.element == "STARTUP" || entry.second.element == "CAPTURE_BLACKBOX") {
+                const auto &ref = entry.second.site;
+                const auto &tile = db.tiles[ref.tile];
+                const auto &site = db.variants[tile.variant].sites[ref.site];
+                WireId pin = site_pin_wire(tile, ref.tile, site, "CLK");
+                pins.insert(pin.index);
+                physical_clock_pins[entry.first][ctx->id("CLK")] = {pin};
+            }
+            if (entry.second.element == "MULT18X18SIO") {
+                const auto &ref = entry.second.site;
+                const auto &tile = db.tiles[ref.tile];
+                const auto &site = db.variants[tile.variant].sites[ref.site];
+                WireId pin = site_pin_wire(tile, ref.tile, site, "CLK");
+                pins.insert(pin.index);
+                physical_clock_pins[entry.first][ctx->id("CLK")] = {pin};
+                physical_clock_pins[entry.first][ctx->id("C")] = {pin};
             }
             if (entry.second.element != "RAMB16") continue;
             const auto &ref = entry.second.site;
@@ -717,11 +879,25 @@ struct Spartan3eIseImpl : ViaductAPI
             for (const std::string &port : {std::string("CLKA"), std::string("CLKB")}) {
                 WireId pin = site_pin_wire(tile, ref.tile, site, port);
                 pins.insert(pin.index);
-                physical_clock_pins[entry.first][ctx->id(port)] = pin;
-                if (port == "CLKA") physical_clock_pins[entry.first][ctx->id("CLK")] = pin;
+                physical_clock_pins[entry.first][ctx->id(port)] = {pin};
+                if (port == "CLKA") physical_clock_pins[entry.first][ctx->id("CLK")] = {pin};
             }
         }
-        index_ise_clock_paths(ctx, clock_sites, pads, pins, ctx->getWires().size, int(pip_meta.size()));
+        index_ise_clock_paths(ctx, clock_sites, pads, pins, ctx->getWires().size, int(pip_meta.size()),
+                              [&](PipId pip) {
+            const auto &meta = pip_meta.at(pip.index);
+            const auto &variant = db.variants[db.tiles[meta.tile].variant];
+            return ise_clock_distribution_pip(db.wires[variant.wires[meta.from]], db.wires[variant.wires[meta.to]]);
+        });
+        for (const auto &memory : ram64_resources)
+            for (int index : memory.sites) {
+                const auto &ref = carry_sites[index].site;
+                const auto &tile = db.tiles[ref.tile];
+                const auto &def = db.variants[tile.variant].sites[ref.site];
+                WireId pin = site_pin_wire(tile, ref.tile, def, "CLK");
+                pins.insert(pin.index);
+                physical_clock_pins[memory.composite.index][ctx->id("WCLK")].push_back(pin);
+            }
         clock_model = std::make_unique<IseClockModel>(ctx, db, std::move(clock_sites),
                                                      std::move(clock_power_bels), std::move(physical_clock_pins));
     }
@@ -763,7 +939,176 @@ struct Spartan3eIseImpl : ViaductAPI
         log_info("Spartan-3E ISE: indexed %zu dedicated wide cascade links\n", count);
     }
 
+    void init_ram64_bels()
+    {
+        for (size_t high = 0; high < carry_sites.size(); ++high) {
+            int low = wide_sources[high][0][0];
+            if (low < 0 || low == int(high) || wide_sources[high][0][1] != int(high)) continue;
+            const auto &hr = carry_sites[high].site;
+            const auto &lr = carry_sites[low].site;
+            const auto &tile = db.tiles[hr.tile];
+            if (hr.tile != lr.tile || db.variants[tile.variant].sites[hr.site].type != "SLICEM" ||
+                db.variants[tile.variant].sites[lr.site].type != "SLICEM") continue;
+            int z = 0;
+            for (const auto &entry : bel_site_info) {
+                Loc loc = ctx->getBelLocation(BelId{entry.first});
+                if (loc.x == tile.col && loc.y == tile.row) z = std::max(z, loc.z + 1);
+            }
+            BelId bel = ctx->addBel(h.xy_id(tile.col, tile.row,
+                IdStringList::concat(ctx->id(tile.sites[hr.site]), ctx->id("RAM64"))),
+                ctx->id("RAM64X1S"), Loc(tile.col, tile.row, z), false, false);
+            bel_site_info[bel.index] = BelSiteInfo{hr, "F6MUX"};
+            IseRam64Resources resources{bel, {low, int(high)}, {}};
+            for (int half = 0; half < 2; ++half) {
+                const auto &ref = carry_sites[resources.sites[half]].site;
+                std::string prefix = half == 0 ? "L" : "H";
+                auto input = [&](const std::string &name, const std::string &element, const std::string &pin) {
+                    ctx->addBelInput(bel, ctx->id(name), site_elem_wire(ref.tile, ref.site, element, pin));
+                };
+                for (const std::string bank : {"F", "G"}) {
+                    for (int i = 0; i < 4; ++i) {
+                        input(prefix + bank + "A" + std::to_string(i), bank, "A" + std::to_string(i + 1));
+                        input(prefix + bank + "W" + std::to_string(i), bank, "W" + bank + std::to_string(i + 1));
+                    }
+                    input(prefix + bank + "D", bank, "DI");
+                }
+                input(prefix + "A4", "F5MUX", "S0");
+                input(prefix + "WA4", "WSGEN", "WE0");
+                input(prefix + "WA5", "WSGEN", "WE1");
+                input(prefix + "WE", "WSGEN", "WE");
+                input(prefix + "CLK", "WSGEN", "CK");
+                ctx->addBelOutput(bel, ctx->id("$RAM64_F5_" + prefix), site_elem_wire(ref.tile, ref.site, "F5MUX", "OUT"));
+                ctx->addBelInput(bel, ctx->id("$RAM64_F6_" + prefix),
+                    site_elem_wire(hr.tile, hr.site, "F6MUX", half == 0 ? "0" : "1"));
+                for (const auto &entry : bel_site_info)
+                    if (entry.first != bel.index && entry.second.site.tile == ref.tile && entry.second.site.site == ref.site)
+                        resources.excluded.push_back(BelId{entry.first});
+            }
+            ctx->addBelInput(bel, ctx->id("A5"), site_elem_wire(hr.tile, hr.site, "F6MUX", "S0"));
+            ctx->addBelOutput(bel, ctx->id("O"), site_elem_wire(hr.tile, hr.site, "F6MUX", "OUT"));
+            ram64_by_bel[bel.index] = ram64_resources.size();
+            ram64_resources.push_back(std::move(resources));
+        }
+    }
 
+
+
+    void index_mult_topology()
+    {
+        std::unordered_map<int32_t, std::pair<int, int>> inputs;
+        for (size_t i = 0; i < mult_sites.size(); ++i) {
+            const auto &ref = mult_sites[i].site;
+            const auto &tile = db.tiles[ref.tile];
+            const auto &def = db.variants[tile.variant].sites[ref.site];
+            for (int bit = 0; bit < 18; ++bit)
+                inputs[site_pin_wire(tile, ref.tile, def, "BCIN" + std::to_string(bit)).index] = {int(i), bit};
+        }
+        for (size_t i = 0; i < mult_sites.size(); ++i) {
+            const auto &ref = mult_sites[i].site;
+            const auto &tile = db.tiles[ref.tile];
+            const auto &def = db.variants[tile.variant].sites[ref.site];
+            int next = -1;
+            bool complete = true;
+            for (int bit = 0; bit < 18; ++bit) {
+                WireId output = site_pin_wire(tile, ref.tile, def, "BCOUT" + std::to_string(bit));
+                int target = -1;
+                auto match = [&](WireId wire) {
+                    auto found = inputs.find(wire.index);
+                    if (found == inputs.end() || found->second.second != bit) return;
+                    if (target >= 0 && target != found->second.first) log_error("spartan3e-ise: ambiguous MULT cascade bit\n");
+                    target = found->second.first;
+                };
+                match(output);
+                for (PipId pip : ctx->getPipsDownhill(output)) match(ctx->getPipDstWire(pip));
+                if (target < 0 || (next >= 0 && next != target)) complete = false;
+                if (target >= 0) next = target;
+            }
+            if (complete) mult_sites[i].next = next;
+        }
+    }
+
+    bool place_mult_chain(const IseMultChain &chain, BelId root,
+                          std::vector<std::pair<CellInfo *, BelId>> &placement) const
+    {
+        auto found = mult_site_by_bel.find(root.index);
+        if (found == mult_site_by_bel.end()) return false;
+        int site = found->second;
+        placement.clear();
+        std::set<int32_t> used;
+        for (CellInfo *cell : chain.cells) {
+            if (site < 0) return false;
+            const auto &target = mult_sites[site];
+            if (!used.insert(target.bel.index).second) return false;
+            auto fixed = cell->attrs.find(ctx->id("BEL"));
+            if (fixed != cell->attrs.end() && fixed->second.as_string() != ctx->getBelName(target.bel).str(ctx)) return false;
+            auto loc = cell->attrs.find(ctx->id("LOC"));
+            if (loc != cell->attrs.end() && loc->second.as_string() != db.tiles[target.site.tile].sites[target.site.site]) return false;
+            CellInfo *occupied = ctx->getBoundBelCell(target.bel);
+            if (occupied != nullptr && occupied != cell && occupied->cluster != chain.root->name) return false;
+            placement.emplace_back(cell, target.bel);
+            site = target.next;
+        }
+        return true;
+    }
+
+    void index_srl_topology()
+    {
+        srl_next_site.assign(carry_sites.size(), -1);
+        std::unordered_map<int32_t, int> inputs;
+        for (size_t i = 0; i < carry_sites.size(); ++i) {
+            const auto &ref = carry_sites[i].site;
+            const auto &tile = db.tiles[ref.tile];
+            const auto &def = db.variants[tile.variant].sites[ref.site];
+            if (def.type == "SLICEM") inputs[site_pin_wire(tile, ref.tile, def, "SHIFTIN").index] = int(i);
+        }
+        for (size_t i = 0; i < carry_sites.size(); ++i) {
+            const auto &ref = carry_sites[i].site;
+            const auto &tile = db.tiles[ref.tile];
+            const auto &def = db.variants[tile.variant].sites[ref.site];
+            if (def.type != "SLICEM") continue;
+            WireId output = site_pin_wire(tile, ref.tile, def, "SHIFTOUT");
+            auto assign = [&](WireId target) {
+                auto found = inputs.find(target.index);
+                if (found == inputs.end()) return;
+                int &next = srl_next_site[i];
+                if (next >= 0 && next != found->second) log_error("spartan3e-ise: ambiguous dedicated SRL site link\n");
+                next = found->second;
+            };
+            assign(output);
+            for (PipId pip : ctx->getPipsDownhill(output)) assign(ctx->getPipDstWire(pip));
+        }
+    }
+
+    bool place_srl_chain(const IseSrlChain &chain, BelId root_bel,
+                         std::vector<std::pair<CellInfo *, BelId>> &placement) const
+    {
+        auto root = carry_bel_slot.find(root_bel.index);
+        if (root == carry_bel_slot.end() || root->second.second != 1 ||
+            carry_sites[root->second.first].lut[1] != root_bel) return false;
+        placement.clear();
+        int site = root->second.first;
+        std::set<int32_t> used;
+        for (size_t i = 0; i < chain.stages.size(); ++i) {
+            if (site < 0) return false;
+            const auto &ref = carry_sites[site].site;
+            if (db.variants[db.tiles[ref.tile].variant].sites[ref.site].type != "SLICEM") return false;
+            int half = i % 2 == 0 ? 1 : 0;
+            for (auto target : {std::make_pair(chain.stages[i].cell, carry_sites[site].lut[half]),
+                                std::make_pair(chain.stages[i].ff, carry_sites[site].ff[half])}) {
+                if (target.first == nullptr) continue;
+                if (!used.insert(target.second.index).second) return false;
+                auto fixed = target.first->attrs.find(ctx->id("BEL"));
+                if (fixed != target.first->attrs.end() && fixed->second.as_string() != ctx->getBelName(target.second).str(ctx)) return false;
+                auto loc = target.first->attrs.find(ctx->id("LOC"));
+                if (loc != target.first->attrs.end() && loc->second.as_string() != db.tiles[ref.tile].sites[ref.site]) return false;
+                CellInfo *occupied = ctx->getBoundBelCell(target.second);
+                if (occupied != nullptr && occupied != target.first && occupied->cluster != chain.root->name) return false;
+                placement.push_back(target);
+            }
+            if (half == 0 && i + 1 < chain.stages.size()) site = srl_next_site[site];
+        }
+        return true;
+    }
 
     bool place_wide_tree(const IseWideTree &tree, BelId root_bel,
                          std::vector<std::pair<CellInfo *, BelId>> &placement) const
@@ -771,25 +1116,58 @@ struct Spartan3eIseImpl : ViaductAPI
         auto root = wide_bel_slot.find(root_bel.index);
         if (root == wide_bel_slot.end() || (tree.root->type == id_MUXF5 ? 0 : 1) != root->second.second)
             return false;
-        std::set<int32_t> used;
-        std::function<bool(int, int, int)> place = [&](int node, int site, int half) {
+        using Assignment = std::vector<int32_t>;
+        std::function<bool(int, int, int, Assignment &)> assign = [&](int node, int site, int half, Assignment &state) {
             if (site < 0) return false;
             const auto &entry = tree.nodes[node];
             bool leaf = is_lut_cell(entry.cell->type);
             int kind = entry.cell->type == id_MUXF5 ? 0 : 1;
             BelId bel = leaf ? carry_sites[site].lut[half] : wide_bels[site][kind];
-            if (!used.insert(bel.index).second) return false;
-            placement.emplace_back(entry.cell, bel);
+            if (state[node] >= 0) return state[node] == bel.index;
+            for (size_t i = 0; i < state.size(); ++i)
+                if (int(i) != node && state[i] == bel.index) return false;
+            auto fixed = entry.cell->attrs.find(ctx->id("BEL"));
+            if (fixed != entry.cell->attrs.end() && fixed->second.as_string() != ctx->getBelName(bel).str(ctx))
+                return false;
+            auto loc = entry.cell->attrs.find(ctx->id("LOC"));
+            const auto &ref = carry_sites[site].site;
+            if (loc != entry.cell->attrs.end() && loc->second.as_string() != db.tiles[ref.tile].sites[ref.site])
+                return false;
+            state[node] = bel.index;
             if (leaf) return true;
             for (int input = 0; input < 2; ++input) {
                 int source_kind = entry.cell->type == id_MUXF6 ? 0 : 1;
                 int source_site = kind == 0 ? site : wide_sources[site][source_kind][input];
-                if (!place(entry.children[input], source_site, 1 - input)) return false;
+                if (!assign(entry.children[input], source_site, 1 - input, state)) return false;
             }
             return true;
         };
+        Assignment state(tree.nodes.size(), -1);
+        if (!assign(0, root->second.first, 0, state)) return false;
+        std::function<bool(Assignment &)> complete = [&](Assignment &current) {
+            int pending = -1;
+            for (size_t i = 0; i < tree.nodes.size(); ++i) {
+                if (current[i] >= 0) continue;
+                for (int child : tree.nodes[i].children)
+                    if (child >= 0 && current[child] >= 0) { pending = int(i); break; }
+                if (pending >= 0) break;
+            }
+            if (pending < 0)
+                return std::all_of(current.begin(), current.end(), [](int32_t bel) { return bel >= 0; });
+            // Another root must agree with an already placed shared child.
+            // Candidate relations come from indexed directed chipdb links.
+            for (size_t site = 0; site < carry_sites.size(); ++site) {
+                Assignment candidate = current;
+                if (!assign(pending, int(site), 0, candidate)) continue;
+                if (complete(candidate)) { current = std::move(candidate); return true; }
+            }
+            return false;
+        };
+        if (!complete(state)) return false;
         placement.clear();
-        return place(0, root->second.first, 0);
+        for (size_t i = 0; i < tree.nodes.size(); ++i)
+            placement.emplace_back(tree.nodes[i].cell, BelId{state[i]});
+        return true;
     }
 
     std::optional<bool> getClusterPlacement(ClusterId cluster, BelId root_bel,
@@ -798,19 +1176,31 @@ struct Spartan3eIseImpl : ViaductAPI
         auto clock = clock_model->get_cluster_placement(cluster, root_bel, placement);
         if (clock.has_value()) return clock;
         auto io = iob_off_clusters.find(cluster);
+        auto input_io = iob_if_clusters.find(cluster);
+        auto tristate_io = iob_tff_clusters.find(cluster);
+        if (io != iob_off_clusters.end() || input_io != iob_if_clusters.end() || tristate_io != iob_tff_clusters.end()) {
+            placement = {{ctx->cells.at(cluster).get(), root_bel}};
+        }
         if (io != iob_off_clusters.end()) {
             auto off = iob_off_bels.find(root_bel.index);
             if (off == iob_off_bels.end()) return false;
-            placement = {{ctx->cells.at(cluster).get(), root_bel}, {io->second, off->second}};
-            return true;
+            placement.emplace_back(io->second, off->second);
         }
-        auto input_io = iob_if_clusters.find(cluster);
         if (input_io != iob_if_clusters.end()) {
             auto ff = iob_if_bels.find(root_bel.index);
             if (ff == iob_if_bels.end()) return false;
-            placement = {{ctx->cells.at(cluster).get(), root_bel}, {input_io->second, ff->second}};
-            return true;
+            placement.emplace_back(input_io->second, ff->second);
         }
+        if (tristate_io != iob_tff_clusters.end()) {
+            auto ff = iob_tff_bels.find(root_bel.index);
+            if (ff == iob_tff_bels.end()) return false;
+            placement.emplace_back(tristate_io->second, ff->second);
+        }
+        if (io != iob_off_clusters.end() || input_io != iob_if_clusters.end() || tristate_io != iob_tff_clusters.end()) return true;
+        auto mult = mult_cluster.find(cluster);
+        if (mult != mult_cluster.end()) return place_mult_chain(mult_chains[mult->second], root_bel, placement);
+        auto srl = srl_cluster.find(cluster);
+        if (srl != srl_cluster.end()) return place_srl_chain(srl_chains[srl->second], root_bel, placement);
         auto wide = wide_cluster.find(cluster);
         if (wide != wide_cluster.end())
             return place_wide_tree(wide_trees[wide->second], root_bel, placement);
@@ -832,7 +1222,8 @@ struct Spartan3eIseImpl : ViaductAPI
             const auto &carry = carry_sites[site];
             const auto &bit = chain.bits[i];
             for (auto target : {std::make_pair(bit.mux, carry.mux[half]), std::make_pair(bit.xorcy, carry.xorcy[half]),
-                                std::make_pair(bit.lut, carry.lut[half]), std::make_pair(bit.ff, carry.ff[half])})
+                                std::make_pair(bit.lut, carry.lut[half]), std::make_pair(bit.ff, carry.ff[half]),
+                                std::make_pair(bit.andcell, carry.andcell[half])})
                 if (target.first != nullptr)
                     placement.push_back(target);
             if (half == 1)
@@ -847,6 +1238,72 @@ struct Spartan3eIseImpl : ViaductAPI
         if (it == site_pip.end())
             return false;
         selected_site_pips.insert(it->second.index);
+        return true;
+    }
+
+    // Dedicated cascade/propagate pins do not consume X/Y. Everything else,
+    // including a local output FF, requires the half's output mux.
+    bool needs_slice_output(CellInfo *cell) const
+    {
+        NetInfo *net = cell->getPort(id_O);
+        if (net == nullptr) return false;
+        for (const auto &user : net->users) {
+            if (user.cell->type.in(id_MUXF5, id_MUXF6, id_MUXF7, id_MUXF8) &&
+                user.port.in(id_I0, id_I1)) continue;
+            if ((user.cell->type == id_MUXCY && user.port == id_S) ||
+                (user.cell->type == id_XORCY && user.port == id_LI)) continue;
+            return true;
+        }
+        return false;
+    }
+
+    bool local_ff_data(CellInfo *ff, const IseSiteRef &site, int half) const
+    {
+        NetInfo *d = ff->getPort(id_D);
+        if (d == nullptr || d->driver.cell == nullptr) return false;
+        auto src = bel_site_info.find(d->driver.cell->bel.index);
+        if (src == bel_site_info.end() || src->second.site.tile != site.tile || src->second.site.site != site.site)
+            return false;
+        const auto &element = src->second.element;
+        return half == 0 ? element == "F" || element == "XORF" || element == "F5MUX"
+                         : element == "G" || element == "XORG" || element == "F6MUX";
+    }
+
+    bool dedicated_carry_input(CellInfo *cell) const
+    {
+        NetInfo *input = cell->getPort(id_CI);
+        if (input == nullptr || input->driver.cell == nullptr || input->driver.cell->type != id_MUXCY ||
+            input->driver.port != id_O || input->driver.cell->cluster != cell->cluster) return false;
+        auto chain = carry_cluster.find(cell->cluster);
+        return chain != carry_cluster.end() && carry_chains[chain->second].root != cell;
+    }
+
+    bool wide_resources_valid(int index) const
+    {
+        const auto &site = carry_sites[index];
+        for (int half = 0; half < 2; ++half) {
+            CellInfo *wide = ctx->getBoundBelCell(wide_bels[index][half]);
+            if (wide == nullptr || !wide->type.in(id_MUXF5, id_MUXF6, id_MUXF7, id_MUXF8)) continue;
+            CellInfo *lut = ctx->getBoundBelCell(site.lut[half]);
+            CellInfo *sum = ctx->getBoundBelCell(site.xorcy[half]);
+            int outputs = int(needs_slice_output(wide));
+            outputs += int(lut != nullptr && is_lut_cell(lut->type) && needs_slice_output(lut));
+            outputs += int(sum != nullptr && needs_slice_output(sum));
+            if (outputs > 1) return false;
+            NetInfo *select = wide->getPort(id_S);
+            CellInfo *ff = ctx->getBoundBelCell(site.ff[half]);
+            if (ff != nullptr && !local_ff_data(ff, site.site, half) && ff->getPort(id_D) != select)
+                return false; // External FF data and the mux select share BX/BY.
+            if (half == 0) {
+                for (BelId carry : {site.mux[0], site.xorcy[0]}) {
+                    CellInfo *cell = ctx->getBoundBelCell(carry);
+                    if (cell == nullptr) continue;
+                    NetInfo *ci = cell->getPort(id_CI);
+                    bool dedicated = dedicated_carry_input(cell);
+                    if (!dedicated && ci != select) return false; // CYINIT=BX.
+                }
+            }
+        }
         return true;
     }
 
@@ -870,6 +1327,7 @@ struct Spartan3eIseImpl : ViaductAPI
                     missing++;
             };
             if (is_lut_cell(ci->type)) {
+                if (!needs_slice_output(ci)) continue;
                 auto slot = carry_bel_slot.at(ci->bel.index);
                 if (ctx->getBoundBelCell(carry_sites[slot.first].xorcy[slot.second]) != nullptr)
                     continue; // The half's fabric output is the arithmetic sum.
@@ -883,8 +1341,107 @@ struct Spartan3eIseImpl : ViaductAPI
             } else if (auto shape = ise_bram_shape(ci->type.str(ctx))) {
                 for (const std::string &port : {std::string("A"), std::string("B")}) {
                     if (port == "B" && !shape->dual) continue;
-                    for (const std::string &control : {std::string("CLK"), std::string("EN"), std::string("WE"), std::string("SSR")})
-                        select(control + port + "INV", control + port);
+                    for (const std::string &control : {std::string("CLK"), std::string("EN"), std::string("WE"), std::string("SSR")}) {
+                        std::string logical = control + (shape->dual ? port : "");
+                        bool inverted = ci->attrs.count(ctx->id("S3E_BRAM_CONTROL_INV_" + logical));
+                        select(control + port + "INV", control + port + (inverted ? "_B" : ""));
+                    }
+                }
+            } else if (auto shape = ise_mult_shape(ctx, ci)) {
+                for (const std::string &physical : {std::string("CLK"), std::string("CEA"), std::string("CEB"),
+                    std::string("CEP"), std::string("RSTA"), std::string("RSTB"), std::string("RSTP")}) {
+                    std::string logical = physical;
+                    if (shape->wrapper && physical == "CLK") logical = "C";
+                    if (shape->wrapper && physical == "CEP") logical = "CE";
+                    if (shape->wrapper && physical == "RSTP") logical = "R";
+                    if (ci->getPort(ctx->id(logical)) == nullptr) continue;
+                    select(physical + "INV", physical + (ise_mult_inverted(ctx, ci, logical) ? "_B" : ""));
+                }
+            } else if (ci->type == ctx->id("RAM64X1S")) {
+                const auto &resources = ram64_resources.at(ram64_by_bel.at(ci->bel.index));
+                for (int half = 0; half < 2; ++half) {
+                    const auto &ref = carry_sites[resources.sites[half]].site;
+                    auto choose = [&](const std::string &elem, const std::string &cfg) {
+                        if (select_site_pip(ref, elem, cfg)) ++selected;
+                        else ++missing;
+                    };
+                    for (const std::string bank : {"F", "G"})
+                        for (int i = 1; i <= 4; ++i) choose("W" + bank + std::to_string(i) + "USED", "0");
+                    choose("CLKINV", "CLK");
+                    choose("SRINV", "SR");
+                    choose("BXINV", "BX");
+                    choose("BYINV", "BY");
+                    choose("DIF_MUX", "ALTDIF");
+                    choose("DIG_MUX", half == 0 ? "BY" : "ALTDIG");
+                    choose("SLICEWE0USED", "0");
+                    choose("SLICEWE1USED", "0");
+                    choose("F5USED", "0");
+                    if (half == 0) choose("DIGUSED", "0");
+                    else {
+                        choose("BYOUTUSED", "0");
+                        choose("BYINVOUTUSED", "0");
+                        choose("GYMUX", "FX");
+                        choose("YUSED", "0");
+                    }
+                }
+            } else if (ci->type == ctx->id("RAM32X1S")) {
+                for (const std::string bank : {"F", "G"})
+                    for (int i = 1; i <= 4; ++i) select("W" + bank + std::to_string(i) + "USED", "0");
+                select("CLKINV", "CLK");
+                select("SRINV", "SR");
+                select("BXINV", "BX");
+                select("BYINV", "BY");
+                select("DIG_MUX", "BY");
+                select("DIF_MUX", "ALTDIF");
+                select("SLICEWE0USED", "0");
+                select("FXMUX", "F5");
+                select("XUSED", "0");
+            } else if (ci->type == ctx->id("RAM16X1D")) {
+                for (const std::string bank : {"F", "G"})
+                    for (int i = 1; i <= 4; ++i) select("W" + bank + std::to_string(i) + "USED", "0");
+                select("CLKINV", "CLK");
+                select("SRINV", "SR");
+                select("BYINV", "BY");
+                select("DIG_MUX", "BY");
+                select("DIF_MUX", "ALTDIF");
+                select("FXMUX", "F");
+                select("GYMUX", "G");
+                select("XUSED", "0");
+                select("YUSED", "0");
+            } else if (is_ise_srl(ctx, ci->type)) {
+                select("CLKINV", "CLK");
+                select("SRINV", "SR");
+                bool local_shift = false;
+                bool cross_shift = false;
+                NetInfo *data = ci->getPort(id_D);
+                if (element == "F" && data != nullptr && data->driver.cell != nullptr &&
+                    data->driver.port == ctx->id("Q15") && ise_srl_cascade(ctx, data->driver.cell)) {
+                    CellInfo *source = data->driver.cell;
+                    auto bound = bel_site_info.find(source->bel.index);
+                    local_shift = bound != bel_site_info.end() && bound->second.element == "G" &&
+                        bound->second.site.tile == site.tile && bound->second.site.site == site.site &&
+                        ctx->getBoundBelCell(source->bel) == source && source->getPort(ctx->id("Q15")) == data;
+                }
+                if (element == "G" && data != nullptr && data->driver.cell != nullptr &&
+                    data->driver.port == ctx->id("Q15") && ise_srl_cascade(ctx, data->driver.cell)) {
+                    auto source = carry_bel_slot.find(data->driver.cell->bel.index);
+                    auto target = carry_bel_slot.find(ci->bel.index);
+                    cross_shift = source != carry_bel_slot.end() && target != carry_bel_slot.end() &&
+                        source->second.second == 0 && srl_next_site[source->second.first] == target->second.first;
+                    if (cross_shift) {
+                        const auto &ref = carry_sites[source->second.first].site;
+                        if (select_site_pip(ref, "SHIFTOUTUSED", "0")) ++selected;
+                        else ++missing;
+                    }
+                }
+                select(element == "F" ? "DIF_MUX" : "DIG_MUX", (local_shift || cross_shift) ? "SHIFTIN" : element == "F" ? "BX" : "BY");
+                if (!local_shift && !cross_shift)
+                    select(element == "F" ? "BXINV" : "BYINV", element == "F" ? "BX" : "BY");
+                select(element == "F" ? "FXMUX" : "GYMUX", element);
+                select(element == "F" ? "XUSED" : "YUSED", "0");
+                if (ise_srl_cascade(ctx, ci)) {
+                    select(element == "F" ? "XBMUX" : "YBMUX", "0");
+                    if (element == "G") select("YBUSED", "0");
                 }
             } else if (ci->type == ctx->id("RAM16X1S")) {
                 for (int i = 1; i <= 4; ++i)
@@ -906,46 +1463,52 @@ struct Spartan3eIseImpl : ViaductAPI
                     select("ISR_USED", "0");
                     continue;
                 }
-                if (element == "OFF1") {
-                    select("O1INV", "O1");
-                    select("O1_DDRMUX", "1");
+                if (element == "OFF1" || element == "TFF1") {
+                    bool tristate = element == "TFF1";
+                    select(tristate ? "T1INV" : "O1INV", tristate ? "T1" : "O1");
+                    if (!tristate) select("O1_DDRMUX", "1");
                     select("OTCLK1INV", "OTCLK1");
                     if (ci->getPort(id_CE) != nullptr) {
-                        select("OCEINV", "OCE");
-                        select("PCICE_MUX", "OCE");
+                        select(tristate ? "TCEINV" : "OCEINV", tristate ? "TCE" : "OCE");
+                        if (!tristate) select("PCICE_MUX", "OCE");
                     }
                     for (IdString port : {ctx->id("R"), id_S, ctx->id("CLR"), ctx->id("PRE")})
                         if (ci->getPort(port) != nullptr) {
                             select("SRINV", "SR");
-                            select("OSR_USED", "0");
+                            select(tristate ? "TSR_USED" : "OSR_USED", "0");
                         }
                     continue;
                 }
-                bool local_d = false;
-                NetInfo *d = ci->getPort(id_D);
-                if (d != nullptr && d->driver.cell != nullptr) {
-                    auto src = bel_site_info.find(d->driver.cell->bel.index);
-                    if (src != bel_site_info.end() && src->second.site.tile == site.tile &&
-                        src->second.site.site == site.site)
-                        local_d = element == "FFX" ? src->second.element == "F" || src->second.element == "XORF"
-                                                   : src->second.element == "G" || src->second.element == "XORG";
-                }
+                bool local_d = local_ff_data(ci, site, element == "FFX" ? 0 : 1);
                 if (element == "FFX")
                     select("DXMUX", local_d ? "1" : "0");
                 else if (element == "FFY")
                     select("DYMUX", local_d ? "1" : "0");
                 if (!local_d)
                     select(element == "FFX" ? "BXINV" : "BYINV", element == "FFX" ? "BX" : "BY");
-                select("CLKINV", "CLK");
-                select("CEINV", "CE");
-                select("SRINV", "SR");
-                if (db.variants[db.tiles[site.tile].variant].sites[site.site].type == "SLICEM")
-                    select("SRFFMUX", "0");
+                const auto shape = *ise_ff_shape(ci->type.str(ctx));
+                select("CLKINV", ise_ff_clock_inverted(ctx, ci) ? "CLK_B" : "CLK");
+                const char *enable = shape.latch ? "GE" : "CE";
+                if (ci->getPort(ctx->id(enable)) != nullptr)
+                    select("CEINV", ise_ff_inverted(ctx, ci, enable) ? "CE_B" : "CE");
+                bool has_sr = false;
+                for (IdString pin : {ctx->id("R"), id_S, ctx->id("CLR"), ctx->id("PRE")})
+                    has_sr |= ci->getPort(pin) != nullptr;
+                if (has_sr) {
+                    select("SRINV", shape.sr != nullptr && ise_ff_inverted(ctx, ci, shape.sr) ? "SR_B" : "SR");
+                    if (db.variants[db.tiles[site.tile].variant].sites[site.site].type == "SLICEM")
+                        select("SRFFMUX", "0");
+                }
+                if (shape.rev != nullptr && ci->getPort(ctx->id(shape.rev)) != nullptr) {
+                    select("BYINV", ise_ff_inverted(ctx, ci, shape.rev) ? "BY_B" : "BY");
+                    select("REVUSED", "0");
+                }
             } else if (ci->type == id_MUXCY) {
                 bool is_g = element == "CYMUXG";
                 select(is_g ? "CYSELG" : "CYSELF", is_g ? "G" : "F");
                 IseCarryDi di = carry_di.at(ci->name);
-                std::string di_cfg = di == IseCarryDi::LutInput ? (is_g ? "G1" : "F1")
+                std::string di_cfg = di == IseCarryDi::Product ? "PROD"
+                                     : di == IseCarryDi::LutInput ? (is_g ? "G1" : "F1")
                                      : di == IseCarryDi::One    ? "1"
                                                                 : "0";
                 select(is_g ? "CY0G" : "CY0F", di_cfg);
@@ -960,24 +1523,37 @@ struct Spartan3eIseImpl : ViaductAPI
                     select(is_g ? "YBUSED" : "XBUSED", "0");
             } else if (ci->type == id_XORCY) {
                 bool is_g = element == "XORG";
-                select(is_g ? "GYMUX" : "FXMUX", is_g ? "GXOR" : "FXOR");
-                select(is_g ? "YUSED" : "XUSED", "0");
+                if (needs_slice_output(ci)) {
+                    select(is_g ? "GYMUX" : "FXMUX", is_g ? "GXOR" : "FXOR");
+                    select(is_g ? "YUSED" : "XUSED", "0");
+                }
             } else if (ci->type.in(id_MUXF5, id_MUXF6, id_MUXF7, id_MUXF8)) {
                 if (ci->type == id_MUXF5) {
                     select("BXINV", "BX");
-                    select("FXMUX", "F5");
-                    select("XUSED", "0");
+                    if (needs_slice_output(ci)) {
+                        select("FXMUX", "F5");
+                        select("XUSED", "0");
+                    }
                     select("F5USED", "0");
                 } else {
                     select("BYINV", "BY");
-                    select("GYMUX", "FX");
-                    select("YUSED", "0");
+                    if (needs_slice_output(ci)) {
+                        select("GYMUX", "FX");
+                        select("YUSED", "0");
+                    }
                     select("FXUSED", "0");
                 }
-            } else if (ci->type.in(id_BUFG, id_BUFGMUX)) {
+            } else if (ci->type.in(id_BUFG, id_BUFGMUX, ctx->id("BUFGMUX_1"))) {
                 select("I0_USED", "0");
-                if (ci->type == id_BUFGMUX) select("I1_USED", "0");
+                if (ci->type != id_BUFG) select("I1_USED", "0");
                 select("SINV", ci->type == id_BUFG ? "S_B" : "S");
+            } else if (ci->type == ctx->id("STARTUP_SPARTAN3E")) {
+                select("CLKINV", "CLK");
+                select("GSRINV", "GSR");
+                select("GTSINV", "GTS");
+            } else if (ci->type == ctx->id("CAPTURE_SPARTAN3")) {
+                select("CLKINV", "CLK");
+                select("CAPINV", "CAP");
             } else if (is_xilinx_io_cell(ci->type)) {
                 json11::Json::object cfg;
                 // An occupied I/O site starts disabled; only the selected mode is enabled.
@@ -986,6 +1562,7 @@ struct Spartan3eIseImpl : ViaductAPI
                     if (!el.cfg.empty())
                         cfg[el.name] = "#OFF";
                 cfg["IOATTRBOX"] = ci->attrs.at(ctx->id("IOSTANDARD")).as_string();
+                cfg["PULL"] = ci->attrs.at(ctx->id("PULL")).as_string();
                 CellInfo *iff = nullptr;
                 auto iff_bel = iob_if_bels.find(ci->bel.index);
                 if (iff_bel != iob_if_bels.end()) iff = ctx->getBoundBelCell(iff_bel->second);
@@ -1039,10 +1616,28 @@ struct Spartan3eIseImpl : ViaductAPI
                     cfg["DRIVEATTRBOX"] = ci->attrs.at(ctx->id("DRIVE")).as_string();
                     cfg["SLEW"] = ci->attrs.at(ctx->id("SLEW")).as_string();
                     if (ci->type.in(id_OBUFT, id_IOBUF)) {
+                        CellInfo *tff = nullptr;
+                        auto tff_bel = iob_tff_bels.find(ci->bel.index);
+                        if (tff_bel != iob_tff_bels.end()) tff = ctx->getBoundBelCell(tff_bel->second);
                         select("T1INV", "T1");
-                        select("TMUX", "T1");
+                        select("TMUX", tff == nullptr ? "T1" : "TFF1");
                         cfg["T1INV"] = "T1";
-                        cfg["TMUX"] = "T1";
+                        cfg["TMUX"] = tff == nullptr ? "T1" : "TFF1";
+                        if (tff != nullptr) {
+                            cfg["TFF1"] = "#FF";
+                            auto init = tff->params.find(ctx->id("INIT"));
+                            cfg["TFF1_INIT_ATTR"] = init != tff->params.end() && init->second.as_int64() == 1 ? "INIT1" : "INIT0";
+                            cfg["OTCLK1INV"] = "OTCLK1";
+                            if (tff->getPort(id_CE) != nullptr) cfg["TCEINV"] = "TCE";
+                            for (IdString port : {ctx->id("R"), id_S, ctx->id("CLR"), ctx->id("PRE")})
+                                if (tff->getPort(port) != nullptr) {
+                                    cfg["SRINV"] = "SR";
+                                    cfg["TSR_USED"] = "0";
+                                    cfg["TFF1_SR_ATTR"] = tff->type.in(id_FDPE, id_FDP, id_FDSE) ? "SRHIGH" : "SRLOW";
+                                    cfg["TFFATTRBOX"] = tff->type.in(id_FDRE, id_FDSE) ? "SYNC" : "ASYNC";
+                                }
+                            ci->attrs[ctx->id("S3E_IO_TFF1")] = Property(tff->name.str(ctx));
+                        }
                     }
                 }
                 ci->attrs[ctx->id("S3E_IO_CFG")] = Property(json11::Json(cfg).dump());
@@ -1053,9 +1648,7 @@ struct Spartan3eIseImpl : ViaductAPI
                 ci->attrs[ctx->id("S3E_IO_PACKAGE")] = Property(db.package);
             }
             if ((ci->type == id_MUXCY && element == "CYMUXF") || (ci->type == id_XORCY && element == "XORF")) {
-                NetInfo *ci_net = ci->getPort(id_CI);
-                bool dedicated =
-                        ci_net != nullptr && ci_net->driver.cell != nullptr && ci_net->driver.cell->type == id_MUXCY;
+                bool dedicated = dedicated_carry_input(ci);
                 select("CYINIT", dedicated ? "CIN" : "BX");
                 if (!dedicated)
                     select("BXINV", "BX");
@@ -1090,9 +1683,9 @@ struct Spartan3eIseImpl : ViaductAPI
 
     static bool is_lut_cell(IdString t) { return t.in(id_LUT1, id_LUT2, id_LUT3, id_LUT4); }
 
-    static bool is_xilinx_ff_cell(IdString t)
+    bool is_xilinx_ff_cell(IdString t) const
     {
-        return t.in(id_FD, id_FDCE, id_FDC, id_FDPE, id_FDP, id_FDRE, id_FDSE, id_FDRSE);
+        return ise_ff_shape(t.str(ctx)).has_value();
     }
 
     static bool is_xilinx_io_cell(IdString t) { return t.in(id_IBUF, id_OBUF, id_OBUFT, id_IOBUF); }
@@ -1144,12 +1737,30 @@ struct Spartan3eIseImpl : ViaductAPI
             };
             if (value("IOSTANDARD", "LVCMOS33") != "LVCMOS33")
                 log_error("spartan3e-ise: unsupported IOSTANDARD on %s (supported: LVCMOS33)\n", ctx->nameOf(ci));
-            if (value("DRIVE", "12") != "12" || value("SLEW", "SLOW") != "SLOW")
-                log_error("spartan3e-ise: unsupported DRIVE/SLEW on %s (supported: 12/SLOW)\n", ctx->nameOf(ci));
-            for (const char *key : {"PULL", "PULLUP", "PULLDOWN", "KEEPER", "DIFF_TERM", "IBUF_LOW_PWR", "IOB",
+            const std::set<std::string> drives = {"2", "4", "6", "8", "12", "16"};
+            if (!drives.count(value("DRIVE", "12")))
+                log_error("spartan3e-ise: unsupported LVCMOS33 DRIVE on %s (supported: 2/4/6/8/12/16)\n", ctx->nameOf(ci));
+            if (value("SLEW", "SLOW") != "SLOW" && value("SLEW", "SLOW") != "FAST")
+                log_error("spartan3e-ise: unsupported SLEW on %s (supported: SLOW/FAST)\n", ctx->nameOf(ci));
+            for (const char *key : {"PULL", "DIFF_TERM", "IBUF_LOW_PWR", "IOB",
                                     "IN_TERM", "OUT_TERM", "IBUF_DELAY_VALUE", "IFD_DELAY_VALUE"})
                 if (ci->attrs.count(ctx->id(key)) || ci->params.count(ctx->id(key)))
                     log_error("spartan3e-ise: unsupported I/O attribute %s on %s\n", key, ctx->nameOf(ci));
+            std::string pull = "#OFF";
+            for (const char *key : {"PULLUP", "PULLDOWN", "KEEPER"}) {
+                if (ci->params.count(ctx->id(key)))
+                    log_error("spartan3e-ise: use port/cell attributes for %s, not parameters\n", key);
+                if (!ci->attrs.count(ctx->id(key))) continue;
+                std::string flag = value(key, "");
+                if (flag != "TRUE" && flag != "FALSE" && flag != "1" && flag != "0")
+                    log_error("spartan3e-ise: %s must be TRUE/FALSE or 1/0 on %s\n", key, ctx->nameOf(ci));
+                if (flag == "TRUE" || flag == "1") {
+                    if (pull != "#OFF") log_error("spartan3e-ise: conflicting I/O pull attributes on %s\n", ctx->nameOf(ci));
+                    pull = key;
+                }
+            }
+            // PULL is a backend diagnostic selection, not an ISE user attribute.
+            ci->attrs[ctx->id("PULL")] = Property(pull);
             // Attribute and parameter forms must not silently disagree.
             for (const char *key : {"IOSTANDARD", "DRIVE", "SLEW"}) {
                 IdString attr = ctx->id(key);
@@ -1256,32 +1867,56 @@ struct Spartan3eIseImpl : ViaductAPI
             inherit_iob_register_attrs(ff);
             auto request = ff->attrs.find(ctx->id("IOB"));
             if (request == ff->attrs.end() || request->second.as_string() != "TRUE") continue;
-            if (ff->type == id_FDRSE) log_error("spartan3e-ise: IOB=TRUE does not support simultaneous set/reset\n");
+            if (!ise_legacy_iob_ff(ctx, ff))
+                log_error("spartan3e-ise: IOB=TRUE does not support extended FF polarity or dual controls\n");
             NetInfo *q = ff->getPort(id_Q);
             CellInfo *buffer = q != nullptr && q->users.entries() == 1 ? (*q->users.begin()).cell : nullptr;
-            bool input = buffer == nullptr || !buffer->type.in(id_OBUF, id_OBUFT, id_IOBUF) || (*q->users.begin()).port != id_I;
+            bool tristate = buffer != nullptr && buffer->type.in(id_OBUFT, id_IOBUF) &&
+                            (*q->users.begin()).port == ctx->id("T");
+            bool input = !tristate && (buffer == nullptr || !buffer->type.in(id_OBUF, id_OBUFT, id_IOBUF) || (*q->users.begin()).port != id_I);
             auto kind = ff->attrs.find(ctx->id("S3E_IOB_KIND"));
             if (kind != ff->attrs.end()) {
                 std::string role = kind->second.as_string();
-                if (role != "IFF1" && role != "OFF1") log_error("spartan3e-ise: unsupported S3E_IOB_KIND\n");
-                if (role == "OFF1" && input) log_error("spartan3e-ise: requested OFF1 lacks a dedicated output-buffer consumer\n");
+                if (role != "IFF1" && role != "OFF1" && role != "TFF1") log_error("spartan3e-ise: unsupported S3E_IOB_KIND\n");
+                if (role == "OFF1" && (input || tristate)) log_error("spartan3e-ise: requested OFF1 lacks a dedicated output-buffer consumer\n");
+                if (role == "TFF1" && !tristate) log_error("spartan3e-ise: requested TFF1 lacks a dedicated tristate-buffer consumer\n");
+                tristate = role == "TFF1";
                 input = role == "IFF1";
             }
             if (input) {
                 NetInfo *d = ff->getPort(id_D);
-                buffer = d != nullptr && d->driver.cell != nullptr && d->driver.cell->type == id_IBUF && d->users.entries() == 1 ? d->driver.cell : nullptr;
+                buffer = d != nullptr && d->driver.cell != nullptr &&
+                                 d->driver.cell->type.in(id_IBUF, id_IOBUF) && d->driver.port == id_O &&
+                                 d->users.entries() == 1
+                             ? d->driver.cell : nullptr;
                 if (buffer == nullptr) log_error("spartan3e-ise: IOB=TRUE requires a dedicated input/output buffer\n");
                 if (!ff->type.in(id_FDCE, id_FDPE)) log_error("spartan3e-ise: IFF1 currently requires FDCE/FDPE\n");
             }
-            if (ff->cluster != ClusterId() || buffer->cluster != ClusterId())
-                log_error("spartan3e-ise: IOB output register conflicts with another cluster\n");
+            auto &clusters = input ? iob_if_clusters : tristate ? iob_tff_clusters : iob_off_clusters;
+            if (ff->cluster != ClusterId() || clusters.count(buffer->name) ||
+                (buffer->cluster != ClusterId() &&
+                 (buffer->cluster != buffer->name ||
+                  (!iob_off_clusters.count(buffer->name) && !iob_if_clusters.count(buffer->name) && !iob_tff_clusters.count(buffer->name)))))
+                log_error("spartan3e-ise: IOB register conflicts with another cluster\n");
+            for (const auto *other_clusters : {&iob_if_clusters, &iob_off_clusters, &iob_tff_clusters}) {
+                auto other = other_clusters->find(buffer->name);
+                if (other == other_clusters->end()) continue;
+                auto sr = [&](CellInfo *cell) -> NetInfo * {
+                    for (IdString port : {ctx->id("R"), id_S, ctx->id("CLR"), ctx->id("PRE")})
+                        if (cell->getPort(port) != nullptr) return cell->getPort(port);
+                    return nullptr;
+                };
+                if (sr(ff) != nullptr && sr(other->second) != nullptr && sr(ff) != sr(other->second))
+                    log_error("spartan3e-ise: IOB registers share one physical SR input\n");
+                if (!input && other_clusters != &iob_if_clusters && ff->getPort(ctx->id("C")) != other->second->getPort(ctx->id("C")))
+                    log_error("spartan3e-ise: OFF1/TFF1 share one physical output clock\n");
+            }
             ff->cluster = buffer->name;
             buffer->cluster = buffer->name;
             buffer->constr_children.push_back(ff);
             ff->constr_x = ff->constr_y = 0;
             ff->constr_abs_z = false;
-            auto &clusters = input ? iob_if_clusters : iob_off_clusters;
-            const auto &register_bels = input ? iob_if_bels : iob_off_bels;
+            const auto &register_bels = input ? iob_if_bels : tristate ? iob_tff_bels : iob_off_bels;
             clusters[buffer->name] = ff;
             auto fixed = buffer->attrs.find(ctx->id("BEL"));
             if (fixed != buffer->attrs.end()) {
@@ -1314,9 +1949,81 @@ struct Spartan3eIseImpl : ViaductAPI
         if (!dump_path.empty()) write_ise_dump();
     }
 
+    std::set<int32_t> route_subtree(const NetInfo *net, WireId root) const
+    {
+        std::set<int32_t> result{root.index};
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (const auto &wire : net->wires) {
+                if (wire.second.pip == PipId() || result.count(wire.first.index)) continue;
+                if (result.count(ctx->getPipSrcWire(wire.second.pip).index)) {
+                    result.insert(wire.first.index);
+                    changed = true;
+                }
+            }
+        }
+        return result;
+    }
+
+    json11::Json::object dump_route_fragment(const NetInfo *net, WireId root,
+        const std::set<int32_t> &wires, const std::function<json11::Json(WireId)> &endpoint) const
+    {
+        using J = json11::Json;
+        J::array pips, pins, routes;
+        std::set<std::pair<std::string, std::string>> seen;
+        for (const auto &wire : net->wires) {
+            if (!wires.count(wire.first.index) || wire.first == root || wire.second.pip == PipId()) continue;
+            PipId pip = wire.second.pip;
+            auto internal = site_route_meta.find(pip.index);
+            if (internal == site_route_meta.end()) {
+                const auto &meta = pip_meta.at(pip.index);
+                const auto &tile = db.tiles[meta.tile];
+                const auto &variant = db.variants[tile.variant];
+                std::string op;
+                for (const auto &row : variant.pips)
+                    if (row.from == meta.from && row.to == meta.to && row.rt == -1) { op = db.pip_ops[row.op]; break; }
+                if (op.empty()) log_error("spartan3e-ise: unknown component pip operator\n");
+                pips.push_back(J::object{{"tile", tile.name}, {"from", db.wires[variant.wires[meta.from]]},
+                    {"to", db.wires[variant.wires[meta.to]]}, {"op", op}});
+                continue;
+            }
+            const auto &meta = internal->second;
+            const auto &tile = db.tiles[meta.site.tile];
+            const auto &def = db.variants[tile.variant].sites[meta.site.site];
+            const auto &conn = meta.connection;
+            J selection;
+            if (meta.selection) selection = J::object{{"element", meta.selection->element}, {"value", meta.selection->cfg}};
+            routes.push_back(J::object{{"site", tile.sites[meta.site.site]},
+                {"from", J::array{conn.src_el, conn.src_pin}}, {"to", J::array{conn.dst_el, conn.dst_pin}}, {"selection", selection}});
+            for (const auto &element : {conn.src_el, conn.dst_el}) {
+                if (!def.pins.count(element) || !seen.emplace(tile.sites[meta.site.site], element).second) continue;
+                std::string direction;
+                for (const auto &pin : db.site_defs.at(def.type).pins)
+                    if (pin.first == element) direction = pin.second;
+                if (direction.empty()) log_error("spartan3e-ise: unknown component boundary pin\n");
+                pins.push_back(J::object{{"site", tile.sites[meta.site.site]}, {"pin", element}, {"direction", direction}});
+            }
+        }
+        return {{"root", endpoint(root)}, {"pins", pins}, {"pips", pips}, {"site_routes", routes}};
+    }
+
     void write_ise_dump()
     {
         using J = json11::Json;
+        // Resolve endpoint identity from typed wire metadata, never BEL names.
+        std::map<int, SiteElemKey> endpoint_by_wire;
+        for (const auto &entry : site_wire)
+            if (!endpoint_by_wire.emplace(entry.second.index, entry.first).second)
+                log_error("spartan3e-ise: ambiguous typed site endpoint\n");
+        auto endpoint = [&](WireId wire) -> J {
+            auto it = endpoint_by_wire.find(wire.index);
+            if (it == endpoint_by_wire.end())
+                log_error("spartan3e-ise: cannot resolve typed endpoint wire\n");
+            const auto &key = it->second;
+            return J::object{{"site", db.tiles[key.tile].sites[key.site]},
+                             {"element", key.element}, {"pin", key.pin}};
+        };
         std::map<std::pair<int, int>, J::array> cells;
         for (const auto &item : ctx->cells) {
             const CellInfo *cell = item.second.get();
@@ -1331,13 +2038,35 @@ struct Spartan3eIseImpl : ViaductAPI
                 if (attr.first.str(ctx).find("S3E_IO_ROUTE") != 0)
                     attrs[attr.first.str(ctx)] = attr.second.to_string();
             for (const auto &port : cell->ports)
-                if (port.second.net != nullptr)
+                if (port.second.net != nullptr && port.first.str(ctx).find("$RAM64_") != 0)
                     ports[port.first.str(ctx)] = port.second.net->name.str(ctx);
-            cells[{site.tile, site.site}].push_back(J::object{
+            J::object exported{
                 {"name", cell->name.str(ctx)}, {"type", cell->type.str(ctx)}, {"element", placed->second.element},
-                {"params", params}, {"attrs", attrs}, {"ports", ports}});
+                {"params", params}, {"attrs", attrs}, {"ports", ports}};
+            auto memory = ram64_by_bel.find(cell->bel.index);
+            if (memory != ram64_by_bel.end()) {
+                J::array footprint, components;
+                const auto &resources = ram64_resources[memory->second];
+                for (int half = 0; half < 2; ++half) {
+                    const auto &ref = carry_sites[resources.sites[half]].site;
+                    footprint.push_back(J::object{{"site", db.tiles[ref.tile].sites[ref.site]}, {"address_base", half * 32}});
+                    const std::string prefix = half == 0 ? "L" : "H";
+                    const NetInfo *net = cell->getPort(ctx->id("$RAM64_F5_" + prefix));
+                    WireId root = ctx->getNetinfoSourceWire(net);
+                    auto component = dump_route_fragment(net, root, route_subtree(net, root), endpoint);
+                    component["kind"] = half == 0 ? "ram64_read_low" : "ram64_read_high";
+                    component["sinks"] = J::array{endpoint(ctx->getBelPinWire(cell->bel, ctx->id("$RAM64_F6_" + prefix)))};
+                    components.push_back(component);
+                }
+                exported["memory_sites"] = footprint;
+                exported["component_routes"] = components;
+            }
+            cells[{site.tile, site.site}].push_back(exported);
         }
         J::array sites, nets;
+        bool has_ram64 = false;
+        for (const auto &memory : ram64_resources)
+            has_ram64 |= ctx->getBoundBelCell(memory.composite) != nullptr;
         for (const auto &site : active_sites) {
             const auto &tile = db.tiles[site.first];
             J::array selections;
@@ -1353,18 +2082,64 @@ struct Spartan3eIseImpl : ViaductAPI
             }
             sites.push_back(J::object{{"site", tile.sites[site.second]}, {"tile", tile.name},
                 {"type", db.variants[tile.variant].sites[site.second].type},
-                {"cells", cells.at(site)}, {"site_pips", selections}});
+                {"cells", cells[site]}, {"site_pips", selections}});
         }
         for (const auto &item : ctx->nets) {
             const NetInfo *net = item.second.get();
             if (net->driver.cell == nullptr || net->wires.empty())
                 continue;
+            if (net->driver.port.str(ctx).find("$RAM64_") == 0) continue;
             // Package-side nets have no fabric representation.
             if (net->driver.cell->type == id_OBUF && net->driver.port == id_O)
                 continue;
-            J::array pips, pins;
+            J::array pips, pins, sinks, site_routes, branches;
+            std::set<int32_t> branch_wires;
+            for (const auto &memory : ram64_resources) {
+                CellInfo *owner = ctx->getBoundBelCell(memory.composite);
+                if (owner == nullptr) continue;
+                const auto &low = carry_sites[memory.sites[0]].site;
+                const auto &high = carry_sites[memory.sites[1]].site;
+                struct Branch { IseSiteRef site; const char *port; const char *kind; const char *transform;
+                    const char *source_element; const char *source_pin; const char *root_element; };
+                const std::array<Branch, 3> definitions{{
+                    {high, "A5", "ram64_byout", "identity", "BYINV", "BY", "BYOUTUSED"},
+                    {high, "A5", "ram64_byinvout", "inverted", "BYINV", "BY", "BYINVOUTUSED"},
+                    {low, "D", "ram64_dig", "identity", "DIG_MUX", "BY", "DIGUSED"}}};
+                for (const auto &definition : definitions) {
+                    if (owner->getPort(ctx->id(definition.port)) != net) continue;
+                    WireId root = site_wire.at(SiteElemKey{definition.site.tile, definition.site.site, definition.root_element, "OUT"});
+                    if (!net->wires.count(root)) log_error("spartan3e-ise: RAM64 physical branch root is unrouted\n");
+                    auto wires = route_subtree(net, root);
+                    auto fragment = dump_route_fragment(net, root, wires, endpoint);
+                    J::array branch_sinks;
+                    for (const PortRef &user : net->users)
+                        for (WireId wire : ctx->getNetinfoSinkWires(net, user))
+                            if (wires.count(wire.index)) branch_sinks.push_back(J::object{
+                                {"cell", user.cell->name.str(ctx)}, {"port", user.port.str(ctx)}, {"endpoint", endpoint(wire)}});
+                    fragment["owner"] = owner->name.str(ctx);
+                    fragment["port"] = definition.port;
+                    fragment["kind"] = definition.kind;
+                    fragment["transform"] = definition.transform;
+                    fragment["source"] = endpoint(site_wire.at(SiteElemKey{definition.site.tile, definition.site.site,
+                        definition.source_element, definition.source_pin}));
+                    fragment["sinks"] = branch_sinks;
+                    branches.push_back(fragment);
+                    branch_wires.insert(wires.begin(), wires.end());
+                }
+            }
+            for (const PortRef &user : net->users) {
+                auto wires = ctx->getNetinfoSinkWires(net, user);
+                if (wires.size() == 0)
+                    log_error("spartan3e-ise: no physical sinks for %s.%s\n",
+                              ctx->nameOf(user.cell), user.port.c_str(ctx));
+                for (WireId wire : wires)
+                    if (!branch_wires.count(wire.index))
+                    sinks.push_back(J::object{{"cell", user.cell->name.str(ctx)},
+                                             {"port", user.port.str(ctx)}, {"endpoint", endpoint(wire)}});
+            }
             std::set<std::pair<std::string, std::string>> seen_pins;
             for (const auto &wire : net->wires) {
+                if (branch_wires.count(wire.first.index)) continue;
                 PipId pip = wire.second.pip;
                 if (pip == PipId())
                     continue;
@@ -1389,6 +2164,12 @@ struct Spartan3eIseImpl : ViaductAPI
                 const auto &tile = db.tiles[meta.site.tile];
                 const auto &def = db.variants[tile.variant].sites[meta.site.site];
                 const auto &conn = meta.connection;
+                J selection;
+                if (meta.selection)
+                    selection = J::object{{"element", meta.selection->element}, {"value", meta.selection->cfg}};
+                site_routes.push_back(J::object{{"site", tile.sites[meta.site.site]},
+                    {"from", J::array{conn.src_el, conn.src_pin}},
+                    {"to", J::array{conn.dst_el, conn.dst_pin}}, {"selection", selection}});
                 for (const auto &element : {conn.src_el, conn.dst_el}) {
                     if (!def.pins.count(element) || !seen_pins.emplace(tile.sites[meta.site.site], element).second)
                         continue;
@@ -1404,22 +2185,16 @@ struct Spartan3eIseImpl : ViaductAPI
             }
             const CellInfo *driver = net->driver.cell;
             const auto &placed = bel_site_info.at(driver->bel.index);
-            J::object root;
             WireId source = ctx->getNetinfoSourceWire(net);
-            for (const auto &entry : site_wire) {
-                if (entry.second != source)
-                    continue;
-                const auto &key = entry.first;
-                root = {{"site", db.tiles[key.tile].sites[key.site]}, {"element", key.element}, {"pin", key.pin}};
-                break;
-            }
-            if (root.empty())
-                log_error("spartan3e-ise: cannot resolve typed source wire for net %s\n", ctx->nameOf(net));
-            nets.push_back(J::object{{"name", net->name.str(ctx)}, {"driver", driver->name.str(ctx)},
+            J root = endpoint(source);
+            J::object exported_net{{"name", net->name.str(ctx)}, {"driver", driver->name.str(ctx)},
                 {"driver_port", net->driver.port.str(ctx)}, {"source_site", db.tiles[placed.site.tile].sites[placed.site.site]},
-                {"root", root}, {"pins", pins}, {"pips", pips}});
+                {"root", root}, {"pins", pins}, {"pips", pips},
+                {"sinks", sinks}, {"site_routes", site_routes}};
+            if (has_ram64) exported_net["branches"] = branches;
+            nets.push_back(exported_net);
         }
-        J dump = J::object{{"format", "spark-ise-route/1"}, {"part", db.part}, {"package", db.package},
+        J dump = J::object{{"format", has_ram64 ? "spark-ise-route/3" : "spark-ise-route/2"}, {"part", db.part}, {"package", db.package},
             {"top", "top"}, {"sites", sites}, {"nets", nets}};
         std::ofstream file(dump_path);
         if (!file || !(file << dump.dump() << '\n'))
@@ -1459,7 +2234,8 @@ struct Spartan3eIseImpl : ViaductAPI
                     const std::string key = attr.first.str(ctx);
                     bool request = key == "IOB" || key == "S3E_IOB_KIND" || key == "LOC" ||
                             key == "PACKAGE_PIN" || key == "BEL" || key == "IOSTANDARD" ||
-                            key == "DRIVE" || key == "SLEW";
+                            key == "DRIVE" || key == "SLEW" || key == "PULL" ||
+                            key == "PULLUP" || key == "PULLDOWN" || key == "KEEPER";
                     if (request && existing != a->attrs.end() && existing->second != attr.second)
                         log_error("spartan3e-ise: conflicting %s across transparent buffer\n", key.c_str());
                     if (existing == a->attrs.end())
@@ -1518,7 +2294,7 @@ struct Spartan3eIseImpl : ViaductAPI
             if (output != nullptr) {
                 for (const auto &user : output->users) {
                     if ((user.cell->type == id_BUFG && user.port == id_I) ||
-                            (user.cell->type == id_BUFGMUX &&
+                            (user.cell->type.in(id_BUFGMUX, ctx->id("BUFGMUX_1")) &&
                              user.port.in(ctx->id("I0"), ctx->id("I1"))))
                         global_input = true;
                 }
@@ -1546,6 +2322,7 @@ struct Spartan3eIseImpl : ViaductAPI
         };
         pack_io_constraints();
         h.remove_nextpnr_iobs(top_ports);
+        fold_ise_bram_control_inverters(ctx);
 
         // ISE #LUT expressions expose only truth-table-dependent input pins.
         // Kept constant leaves must not export fabric nets to unused F/G pins.
@@ -1579,6 +2356,24 @@ struct Spartan3eIseImpl : ViaductAPI
 
         const dict<IdString, Property> vcc_params = {{id_INIT, Property(0xFFFF, 16)}};
         const dict<IdString, Property> gnd_params = {{id_INIT, Property(0x0000, 16)}};
+        std::vector<CellInfo *> always_enabled_srls;
+        for (auto &entry : ctx->cells) {
+            CellInfo *cell = entry.second.get();
+            if (!is_ise_srl(ctx, cell->type)) continue;
+            validate_ise_srl(ctx, cell);
+            if (cell->type.in(ctx->id("SRL16"), ctx->id("SRLC16"))) always_enabled_srls.push_back(cell);
+        }
+        if (!always_enabled_srls.empty()) {
+            CellInfo *one = ctx->createCell(ctx->id("$ISE_SRL_ENABLE"), id_LUT4);
+            one->params[id_INIT] = Property(0xffff, 16);
+            one->addOutput(id_O);
+            NetInfo *enable = ctx->createNet(ctx->id("$ISE_SRL_ENABLE_NET"));
+            one->connectPort(id_O, enable);
+            for (CellInfo *cell : always_enabled_srls) {
+                cell->addInput(id_CE);
+                cell->connectPort(id_CE, enable);
+            }
+        }
         h.replace_constants(CellTypePort(id_LUT4, id_O), CellTypePort(id_LUT4, id_O), vcc_params, gnd_params);
 
         pool<CellTypePort> lut_src_ports;
@@ -1586,14 +2381,63 @@ struct Spartan3eIseImpl : ViaductAPI
             lut_src_ports.insert(CellTypePort(lut, id_O));
 
         pool<CellTypePort> ff_sink_ports;
-        for (IdString ff : {id_FD, id_FDCE, id_FDC, id_FDPE, id_FDP, id_FDRE, id_FDSE, id_FDRSE})
-            ff_sink_ports.insert(CellTypePort(ff, id_D));
+        for (auto &entry : ctx->cells)
+            if (ise_mult_type(ctx, entry.second->type)) remap_ise_mult(ctx, entry.second.get());
+        for (auto &entry : ctx->cells)
+            if (is_xilinx_ff_cell(entry.second->type)) {
+                validate_ise_ff(ctx, entry.second.get());
+                ff_sink_ports.insert(CellTypePort(entry.second->type, id_D));
+            }
 
         wide_trees = pack_ise_wide(ctx);
+        mult_chains = pack_ise_mult_chains(ctx);
+        for (size_t i = 0; i < mult_chains.size(); ++i) {
+            const auto &chain = mult_chains[i];
+            mult_cluster[chain.root->name] = i;
+            std::vector<std::pair<CellInfo *, BelId>> placement;
+            bool legal = false;
+            for (const auto &site : mult_sites)
+                if (place_mult_chain(chain, site.bel, placement)) { legal = true; break; }
+            if (!legal)
+                log_error("spartan3e-ise: MULT cascade has no legal dedicated footprint (fixed adjacency or occupancy conflict)\n");
+            if (chain.root->attrs.count(ctx->id("BEL"))) fix_cluster_placement(placement);
+        }
         clock_model->pack();
         pack_iob_off();
-        for (size_t i = 0; i < wide_trees.size(); ++i)
+        // A non-inverted literal-low SR does not consume slice SR. Preserve
+        // FF identity/type/CE; IOB controls retain their separate contract.
+        for (auto &entry : ctx->cells) {
+            CellInfo *ff = entry.second.get();
+            if (iob_off_clusters.count(ff->cluster) || iob_if_clusters.count(ff->cluster) || iob_tff_clusters.count(ff->cluster))
+                continue;
+            disconnect_ise_inactive_ff_sr(ctx, ff, [&](IdString type) { return is_lut_cell(type); });
+        }
+        srl_chains = pack_ise_srl_chains(ctx);
+        for (size_t i = 0; i < srl_chains.size(); ++i) {
+            const auto &chain = srl_chains[i];
+            srl_cluster[chain.root->name] = i;
+            std::vector<std::pair<CellInfo *, BelId>> placement;
+            bool legal = false;
+            for (const auto &site : carry_sites)
+                if (place_srl_chain(chain, site.lut[1], placement)) { legal = true; break; }
+            if (!legal) log_error("spartan3e-ise: SRL chain has no legal dedicated footprint (fixed adjacency or occupancy conflict)\n");
+            if (chain.root->attrs.count(ctx->id("BEL"))) fix_cluster_placement(placement);
+        }
+        for (size_t i = 0; i < wide_trees.size(); ++i) {
             wide_cluster[wide_trees[i].root->name] = i;
+            std::vector<std::pair<CellInfo *, BelId>> placement;
+            bool legal = false;
+            for (const auto &site : wide_bels)
+                if (place_wide_tree(wide_trees[i], site[wide_trees[i].root->type == id_MUXF5 ? 0 : 1], placement)) {
+                    legal = true;
+                    break;
+                }
+            if (!legal)
+                log_error("spartan3e-ise: wide DAG %s has no legal dedicated footprint (sharing or fixed BEL conflict)\n",
+                          wide_trees[i].root->name.c_str(ctx));
+            if (wide_trees[i].root->attrs.count(ctx->id("BEL")))
+                fix_cluster_placement(placement);
+        }
         int pairs = h.constrain_cell_pairs(lut_src_ports, ff_sink_ports, 1);
         log_info("Spartan-3E ISE: constrained %d LUT/DFF pairs\n", pairs);
 
@@ -1605,9 +2449,23 @@ struct Spartan3eIseImpl : ViaductAPI
                 ci->bel_pins[id_I] = {id_IO};
             else if (ci->type == id_OBUF || ci->type == id_OBUFT)
                 ci->bel_pins[id_O] = {id_IO};
+            else if (ci->type == ctx->id("RAM32X1S"))
+                remap_ise_ram32(ctx, ci);
+            else if (ci->type == ctx->id("RAM64X1S"))
+                remap_ise_ram64(ctx, ci);
+            else if (ci->type == ctx->id("RAM16X1D"))
+                remap_ise_ram16_dual(ctx, ci);
             else if (ci->type == ctx->id("RAM16X1S"))
                 for (int i = 0; i < 4; ++i)
                     ci->bel_pins[ctx->idf("A%d", i)] = {ctx->idf("A%d", i), ctx->idf("WA%d", i)};
+            else if (auto shape = ise_ff_shape(ci->type.str(ctx))) {
+                if (shape->latch) {
+                    ci->bel_pins[ctx->id("G")] = {ctx->id("C")};
+                    ci->bel_pins[ctx->id("GE")] = {ctx->id("CE")};
+                }
+                if (shape->rev != nullptr)
+                    ci->bel_pins[ctx->id(shape->rev)] = {ctx->id(shape->sr_high ? "REV_R" : "REV_S")};
+            }
             else if (auto shape = ise_bram_shape(ci->type.str(ctx))) remap_ise_bram_ports(ctx, ci, *shape);
         }
 
@@ -1617,6 +2475,62 @@ struct Spartan3eIseImpl : ViaductAPI
             for (auto &bit : carry_chains[i].bits)
                 if (bit.mux != nullptr)
                     carry_di[bit.mux->name] = bit.di;
+            auto fixed = carry_chains[i].root->attrs.find(ctx->id("BEL"));
+            if (fixed != carry_chains[i].root->attrs.end()) {
+                std::vector<std::pair<CellInfo *, BelId>> placement;
+                auto legal = getClusterPlacement(carry_chains[i].root->name,
+                    ctx->getBelByNameStr(fixed->second.as_string()), placement);
+                if (!legal.value_or(false)) log_error("spartan3e-ise: invalid fixed carry footprint\n");
+                fix_cluster_placement(placement);
+            }
+        }
+        constrain_ff_locations();
+    }
+
+    void constrain_ff_locations()
+    {
+        // LOC selects a physical slice, not one arbitrary FFX/FFY BEL. Give
+        // HeAP the actual search region as well as the legality predicate.
+        // Otherwise a valid isolated FF can exhaust random placement attempts.
+        for (auto &entry : ctx->cells) {
+            CellInfo *cell = entry.second.get();
+            if (!ise_ff_shape(cell->type.str(ctx))) continue;
+            auto loc = cell->attrs.find(ctx->id("LOC"));
+            if (loc == cell->attrs.end()) continue;
+            std::string site = loc->second.as_string();
+            if (site.compare(0, 6, "SLICE_") != 0) continue;
+            auto region = cell->region == nullptr ? std::make_unique<Region>() :
+                std::make_unique<Region>(*cell->region);
+            region->name = ctx->id("$ISE_FF_LOC_" + cell->name.str(ctx));
+            region->constr_bels = true;
+            region->bels.clear();
+            for (const auto &bel : bel_site_info) {
+                if (bel.second.element != "FFX" && bel.second.element != "FFY") continue;
+                const auto &ref = bel.second.site;
+                BelId candidate{bel.first};
+                if (db.tiles[ref.tile].sites[ref.site] == site && cell->testRegion(candidate))
+                    region->bels.insert(candidate);
+            }
+            if (region->bels.empty())
+                log_error("spartan3e-ise: FF LOC has no available slice BEL: %s (%s)\n",
+                          ctx->nameOf(cell), site.c_str());
+            if (ctx->region.count(region->name))
+                log_error("spartan3e-ise: duplicate FF LOC region for %s\n", ctx->nameOf(cell));
+            cell->region = region.get();
+            ctx->region[cell->region->name] = std::move(region);
+        }
+    }
+
+    void fix_cluster_placement(const std::vector<std::pair<CellInfo *, BelId>> &placement)
+    {
+        // HeAP does not place children of a fixed root. Pin the entire actual
+        // footprint, preserving every pre-existing child BEL constraint.
+        for (const auto &entry : placement) {
+            std::string name = ctx->getBelName(entry.second).str(ctx);
+            auto fixed = entry.first->attrs.find(ctx->id("BEL"));
+            if (fixed != entry.first->attrs.end() && fixed->second.as_string() != name)
+                log_error("spartan3e-ise: conflicting fixed cluster BEL for %s\n", ctx->nameOf(entry.first));
+            entry.first->attrs[ctx->id("BEL")] = Property(name);
         }
     }
 
@@ -1631,6 +2545,12 @@ struct Spartan3eIseImpl : ViaductAPI
             auto it = bel_site_info.find(ci->bel.index);
             if (it != bel_site_info.end())
                 active_sites.insert({it->second.site.tile, it->second.site.site});
+            auto memory = ram64_by_bel.find(ci->bel.index);
+            if (memory != ram64_by_bel.end())
+                for (int index : ram64_resources[memory->second].sites) {
+                    const auto &ref = carry_sites[index].site;
+                    active_sites.insert({ref.tile, ref.site});
+                }
         }
         build_site_graph();
         assign_site_info();
@@ -1653,21 +2573,26 @@ struct Spartan3eIseImpl : ViaductAPI
             return id_DFF;
         if (is_lut_cell(cell_type))
             return id_LUT4;
-        if (cell_type == ctx->id("RAM16X1S")) return id_LUT4;
+        if (cell_type == ctx->id("RAM16X1S") || is_ise_srl(ctx, cell_type)) return id_LUT4;
         if (ise_bram_shape(cell_type.str(ctx))) return ctx->id("RAMB16");
+        if (ise_mult_type(ctx, cell_type)) return ctx->id("MULT18X18SIO");
         if (cell_type.in(id_MUXF6, id_MUXF7, id_MUXF8))
             return id_MUXF6;
-        if (cell_type == id_BUFG) return id_BUFGMUX;
+        if (cell_type.in(id_BUFG, ctx->id("BUFGMUX_1"))) return id_BUFGMUX;
+        if (cell_type == ctx->id("STARTUP_SPARTAN3E")) return id_STARTUP;
+        if (cell_type == ctx->id("CAPTURE_SPARTAN3")) return id_CAPTURE;
+        if (cell_type == ctx->id("BSCAN_SPARTAN3")) return id_BSCAN;
         return cell_type;
     }
 
     BelBucketId getBelBucketForBel(BelId bel) const override
-    { return ctx->getBelType(bel).in(ctx->id("IOB_OFF1"), ctx->id("IOB_IFF1")) ? id_DFF : ctx->getBelType(bel); }
+    { return ctx->getBelType(bel).in(ctx->id("IOB_OFF1"), ctx->id("IOB_IFF1"), ctx->id("IOB_TFF1")) ? id_DFF : ctx->getBelType(bel); }
 
     bool isValidBelForCellType(IdString cell_type, BelId bel) const override
     {
         IdString bel_type = ctx->getBelType(bel);
-        if (bel_type == ctx->id("IOB_OFF1")) return is_xilinx_ff_cell(cell_type) && cell_type != id_FDRSE;
+        if (bel_type == ctx->id("IOB_OFF1")) return cell_type.in(id_FD, id_FDCE, id_FDC, id_FDPE, id_FDP, id_FDRE, id_FDSE);
+        if (bel_type == ctx->id("IOB_TFF1")) return cell_type.in(id_FD, id_FDCE, id_FDC, id_FDPE, id_FDP, id_FDRE, id_FDSE);
         if (bel_type == ctx->id("IOB_IFF1")) return cell_type.in(id_FDCE, id_FDPE);
         if (bel_type == id_IOB) {
             const auto &ref = bel_site_info.at(bel.index).site;
@@ -1678,7 +2603,7 @@ struct Spartan3eIseImpl : ViaductAPI
         if (bel_type == id_DFF)
             return is_xilinx_ff_cell(cell_type);
         if (bel_type == id_LUT4) {
-            if (cell_type == ctx->id("RAM16X1S")) {
+            if (cell_type == ctx->id("RAM16X1S") || is_ise_srl(ctx, cell_type)) {
                 const auto &ref = bel_site_info.at(bel.index).site;
                 return db.variants[db.tiles[ref.tile].variant].sites[ref.site].type == "SLICEM";
             }
@@ -1686,15 +2611,112 @@ struct Spartan3eIseImpl : ViaductAPI
         }
         if (bel_type == id_MUXF6)
             return cell_type.in(id_MUXF6, id_MUXF7, id_MUXF8);
-        if (bel_type == id_BUFGMUX) return cell_type.in(id_BUFG, id_BUFGMUX);
+        if (bel_type == id_BUFGMUX) return cell_type.in(id_BUFG, id_BUFGMUX, ctx->id("BUFGMUX_1"));
+        if (bel_type == id_STARTUP) return cell_type == ctx->id("STARTUP_SPARTAN3E");
+        if (bel_type == id_CAPTURE) return cell_type == ctx->id("CAPTURE_SPARTAN3");
+        if (bel_type == id_BSCAN) return cell_type == ctx->id("BSCAN_SPARTAN3");
         if (bel_type == ctx->id("RAMB16")) return ise_bram_shape(cell_type.str(ctx)).has_value();
+        if (bel_type == ctx->id("MULT18X18SIO")) return ise_mult_type(ctx, cell_type);
         return bel_type == cell_type;
+    }
+
+    bool ff_rev_resources_valid(int index) const
+    {
+        const auto &site = carry_sites[index];
+        for (int half = 0; half < 2; ++half) {
+            CellInfo *ff = ctx->getBoundBelCell(site.ff[half]);
+            if (ff == nullptr) continue;
+            auto shape = ise_ff_shape(ff->type.str(ctx));
+            if (!shape || shape->rev == nullptr) continue;
+            NetInfo *rev = ff->getPort(ctx->id(shape->rev));
+            if (rev == nullptr) continue;
+            // REV takes the shared BY input. Keep unverified memory/carry/FX
+            // mixtures closed; ordinary LUT data paths do not consume BY.
+            if (ctx->getBoundBelCell(wide_bels[index][1]) != nullptr) return false;
+            for (int other = 0; other < 2; ++other) {
+                CellInfo *logic = ctx->getBoundBelCell(site.lut[other]);
+                if (logic != nullptr && !is_lut_cell(logic->type)) return false;
+                if (ctx->getBoundBelCell(site.mux[other]) != nullptr ||
+                    ctx->getBoundBelCell(site.xorcy[other]) != nullptr) return false;
+            }
+            CellInfo *y = ctx->getBoundBelCell(site.ff[1]);
+            if (y != nullptr && !local_ff_data(y, site.site, 1) &&
+                (y->getPort(id_D) != rev || ise_ff_inverted(ctx, ff, shape->rev))) return false;
+        }
+        return true;
     }
 
     bool isBelLocationValid(BelId bel, bool) const override
     {
+        auto wide_slot = wide_bel_slot.find(bel.index);
+        auto carry_slot = carry_bel_slot.find(bel.index);
+        if (wide_slot != wide_bel_slot.end() || carry_slot != carry_bel_slot.end()) {
+            int index = carry_slot != carry_bel_slot.end() ? carry_slot->second.first : wide_slot->second.first;
+            if (!ff_rev_resources_valid(index)) return false;
+            const auto &site = carry_sites[index];
+            std::array<CellInfo *, 2> logic, ffs;
+            std::vector<CellInfo *> excluded;
+            for (int half = 0; half < 2; ++half) {
+                logic[half] = ctx->getBoundBelCell(site.lut[half]);
+                ffs[half] = ctx->getBoundBelCell(site.ff[half]);
+                excluded.push_back(ctx->getBoundBelCell(site.mux[half]));
+                excluded.push_back(ctx->getBoundBelCell(site.xorcy[half]));
+                excluded.push_back(ctx->getBoundBelCell(site.andcell[half]));
+                excluded.push_back(ctx->getBoundBelCell(wide_bels[index][half]));
+            }
+            // Cluster/fixed BELs are checked one at a time. Permit the actual
+            // not-yet-bound G member, never an inferred dummy memory.
+            // Final route policy still requires an actual occupied G SRL.
+            if (logic[0] != nullptr && is_ise_srl(ctx, logic[0]->type) && logic[1] == nullptr) {
+                const std::string fixed_g = ctx->getBelName(site.lut[1]).str(ctx);
+                CellInfo *pending = nullptr;
+                auto cluster = srl_cluster.find(logic[0]->cluster);
+                if (cluster != srl_cluster.end()) {
+                    const auto &stages = srl_chains[cluster->second].stages;
+                    for (size_t i = 1; i < stages.size(); i += 2)
+                        if (stages[i].cell == logic[0]) {
+                            CellInfo *peer = stages[i - 1].cell;
+                            auto fixed = peer->attrs.find(ctx->id("BEL"));
+                            if (peer->bel == BelId() && (fixed == peer->attrs.end() || fixed->second.as_string() == fixed_g))
+                                pending = peer;
+                        }
+                }
+                for (const auto &entry : ctx->cells) {
+                    CellInfo *candidate = entry.second.get();
+                    auto fixed = candidate->attrs.find(ctx->id("BEL"));
+                    if (!is_ise_srl(ctx, candidate->type) || candidate->bel != BelId() ||
+                        fixed == candidate->attrs.end() || fixed->second.as_string() != fixed_g) continue;
+                    if (pending != nullptr && pending != candidate) return false;
+                    pending = candidate;
+                }
+                logic[1] = pending;
+            }
+            if (!ise_srl_resources_valid(ctx, logic, ffs, excluded)) return false;
+        }
+        if (wide_slot != wide_bel_slot.end() && !wide_resources_valid(wide_slot->second.first)) return false;
+        if (carry_slot != carry_bel_slot.end() && !wide_resources_valid(carry_slot->second.first)) return false;
+        for (const auto &memory : ram64_resources) {
+            if (bel != memory.composite && std::find(memory.excluded.begin(), memory.excluded.end(), bel) == memory.excluded.end()) continue;
+            if (ctx->getBoundBelCell(memory.composite) == nullptr) continue;
+            for (BelId excluded : memory.excluded)
+                if (ctx->getBoundBelCell(excluded) != nullptr) return false;
+        }
+        auto dual = ram16_dual_resource_by_bel.find(bel.index);
+        if (dual != ram16_dual_resource_by_bel.end() &&
+            !ise_ram16_dual_resources_valid(ctx, ram16_dual_resources[dual->second])) return false;
+        auto ram32 = ram32_resource_by_bel.find(bel.index);
+        if (ram32 != ram32_resource_by_bel.end() && !ise_ram32_resources_valid(ctx, ram32_resources[ram32->second]))
+            return false;
         CellInfo *bound = ctx->getBoundBelCell(bel);
+        if (bound != nullptr && ise_ff_shape(bound->type.str(ctx)).has_value()) {
+            auto loc = bound->attrs.find(ctx->id("LOC"));
+            if (loc != bound->attrs.end()) {
+                const auto &ref = bel_site_info.at(bel.index).site;
+                if (loc->second.as_string() != db.tiles[ref.tile].sites[ref.site]) return false;
+            }
+        }
         if (bound != nullptr && ctx->getBelType(bel) == ctx->id("IOB_OFF1") && !iob_off_clusters.count(bound->cluster)) return false;
+        if (bound != nullptr && ctx->getBelType(bel) == ctx->id("IOB_TFF1") && !iob_tff_clusters.count(bound->cluster)) return false;
         if (bound != nullptr && ctx->getBelType(bel) == ctx->id("IOB_IFF1") && !iob_if_clusters.count(bound->cluster)) return false;
         if (bound != nullptr && !clock_model->region_valid(bound, bel)) return false;
         auto slot = carry_bel_slot.find(bel.index);
@@ -1711,9 +2733,12 @@ struct Spartan3eIseImpl : ViaductAPI
                                         peer->getPort(ctx->id("WE")) != ram->getPort(ctx->id("WE")))) return false;
                     CellInfo *ff = ctx->getBoundBelCell(site.ff[other]);
                     if (ff == nullptr) continue;
-                    if (ff->getPort(ctx->id("C")) != ram->getPort(ctx->id("WCLK"))) return false;
+                    if (ff->getPort(ctx->id("C")) != ram->getPort(ctx->id("WCLK")) || ise_ff_clock_inverted(ctx, ff)) return false;
                     for (IdString pin : {ctx->id("R"), id_S, ctx->id("CLR"), ctx->id("PRE")})
-                        if (ff->getPort(pin) != nullptr && ff->getPort(pin) != ram->getPort(ctx->id("WE"))) return false;
+                        // ISE rejects simultaneous SR->WSGEN.WE and SR->FF.SR,
+                        // including aliases of the same logical net. Keep the
+                        // output-register form without SR until a legal case exists.
+                        if (ff->getPort(pin) != nullptr) return false;
                     if (half == other) {
                         NetInfo *d = ff->getPort(id_D);
                         bool local = d != nullptr && d->driver.cell == ram;
@@ -1747,40 +2772,7 @@ struct Spartan3eIseImpl : ViaductAPI
         CellInfo *b = ctx->getBoundBelCell(other);
         if (a == nullptr || b == nullptr)
             return true;
-        auto get_net = [](CellInfo *cell, IdString pin) -> NetInfo * {
-            auto it = cell->ports.find(pin);
-            return it == cell->ports.end() ? nullptr : it->second.net;
-        };
-        for (IdString pin : {ctx->id("C"), id_CE}) {
-            NetInfo *na = get_net(a, pin);
-            NetInfo *nb = get_net(b, pin);
-            if ((na == nullptr) != (nb == nullptr))
-                return false;
-            if (na != nullptr && na != nb)
-                return false;
-        }
-        // CLR/PRE/R/S all use the one physical slice SR wire. Its active
-        // value is configured per FF, but synchronization is slice-wide.
-        // Simultaneous set/reset is not supported by the native exporter.
-        if (a->type == id_FDRSE || b->type == id_FDRSE)
-            return false;
-        auto get_sr = [&](CellInfo *cell) -> NetInfo * {
-            if (cell->type.in(id_FDCE, id_FDC))
-                return get_net(cell, ctx->id("CLR"));
-            if (cell->type.in(id_FDPE, id_FDP))
-                return get_net(cell, ctx->id("PRE"));
-            if (cell->type == id_FDRE)
-                return get_net(cell, ctx->id("R"));
-            if (cell->type == id_FDSE)
-                return get_net(cell, id_S);
-            return nullptr;
-        };
-        NetInfo *sr_a = get_sr(a), *sr_b = get_sr(b);
-        if (sr_a != sr_b)
-            return false;
-        if (sr_a != nullptr && a->type.in(id_FDRE, id_FDSE) != b->type.in(id_FDRE, id_FDSE))
-            return false;
-        return true;
+        return ise_ff_pair_valid(ctx, a, b);
     }
 
     void build_wires()

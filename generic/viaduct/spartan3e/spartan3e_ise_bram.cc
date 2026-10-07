@@ -1,7 +1,49 @@
 /* Primitive BRAM port policy; physical routing remains sourced from primitive_defs. */
 #include "spartan3e_ise_bram.h"
+#include "log.h"
 
 NEXTPNR_NAMESPACE_BEGIN
+
+void fold_ise_bram_control_inverters(Context *ctx)
+{
+    std::vector<IdString> removed;
+    for (auto &entry : ctx->cells) {
+        CellInfo *bram = entry.second.get();
+        auto shape = ise_bram_shape(bram->type.str(ctx));
+        if (!shape) continue;
+        for (const auto &attr : bram->attrs)
+            if (attr.first.str(ctx).compare(0, 21, "S3E_BRAM_CONTROL_INV_") == 0)
+                log_error("spartan3e-ise: BRAM control inversion provenance is backend-owned\n");
+        for (int side = 0; side < (shape->dual ? 2 : 1); ++side) {
+            const std::string suffix = shape->dual ? (side == 0 ? "A" : "B") : "";
+            for (const std::string control : {"CLK", "EN", "WE", "SSR"}) {
+                const std::string logical = control + suffix;
+                IdString port = ctx->id(logical);
+                NetInfo *output = bram->getPort(port);
+                if (output == nullptr || output->driver.cell == nullptr || output->users.entries() != 1) continue;
+                CellInfo *inv = output->driver.cell;
+                const PortRef &sink = *output->users.begin();
+                if (inv->type != ctx->id("INV") || output->driver.port != ctx->id("O") ||
+                    sink.cell != bram || sink.port != port || inv->ports.size() != 2 || !inv->params.empty()) continue;
+                bool top_output = false;
+                for (const auto &top : ctx->ports) top_output |= top.second.net == output;
+                if (top_output || inv->attrs.count(ctx->id("BEL")) || inv->attrs.count(ctx->id("LOC"))) continue;
+                NetInfo *input = inv->getPort(ctx->id("I"));
+                if (input == nullptr || input == output) continue;
+                if (output->clkconstr && input->clkconstr)
+                    log_error("spartan3e-ise: conflicting clock constraints across BRAM control inverter\n");
+                if (!input->clkconstr) input->clkconstr = std::move(output->clkconstr);
+                bram->disconnectPort(port);
+                bram->connectPort(port, input);
+                bram->attrs[ctx->id("S3E_BRAM_CONTROL_INV_" + logical)] = Property(inv->name.str(ctx));
+                inv->disconnectPort(ctx->id("I"));
+                inv->disconnectPort(ctx->id("O"));
+                removed.push_back(inv->name);
+            }
+        }
+    }
+    for (IdString cell : removed) ctx->cells.erase(cell);
+}
 
 std::optional<IseBramShape> ise_bram_shape(const std::string &kind)
 {

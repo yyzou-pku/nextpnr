@@ -17,6 +17,7 @@ struct IseBramShape {
 };
 std::optional<IseBramShape> ise_bram_shape(const std::string &kind);
 void remap_ise_bram_ports(Context *ctx, CellInfo *cell, const IseBramShape &shape);
+void fold_ise_bram_control_inverters(Context *ctx);
 
 NEXTPNR_NAMESPACE_END
 #endif

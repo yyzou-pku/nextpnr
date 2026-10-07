@@ -16,6 +16,7 @@ struct IseWideNode
 struct IseWideTree
 {
     CellInfo *root = nullptr;
+    // Connected dedicated DAG; each cell appears once. root is the anchor.
     std::vector<IseWideNode> nodes;
 };
 

@@ -38,7 +38,7 @@ std::optional<bool> constant_value(NetInfo *net)
     return std::nullopt;
 }
 
-CellInfo *private_lut(Context *ctx, CellInfo *owner, NetInfo *propagate, NetInfo *di)
+CellInfo *private_lut(Context *ctx, CellInfo *owner, NetInfo *propagate, NetInfo *di, CellInfo *product = nullptr)
 {
     if (propagate == nullptr)
         log_error("Spartan-3E ISE: carry %s has no propagate input\n", owner->name.c_str(ctx));
@@ -56,15 +56,26 @@ CellInfo *private_lut(Context *ctx, CellInfo *owner, NetInfo *propagate, NetInfo
 
     // CY0F/G can use F1/G1. Keep the DI net on LUT input zero and permute
     // INIT, so a variable DI does not compete with the root's BX carry-in.
-    if (di != nullptr && old_inputs.size() == 4 &&
-        std::find(old_inputs.begin(), old_inputs.end(), di) == old_inputs.end()) {
+    std::vector<NetInfo *> forced;
+    if (product != nullptr) {
+        for (int i = 0; i < 2; ++i) {
+            auto *net = product->getPort(ctx->idf("I%d", i));
+            if (net == nullptr) log_error("Spartan-3E ISE: missing MULT_AND input\n");
+            if (std::find(forced.begin(), forced.end(), net) == forced.end()) forced.push_back(net);
+        }
+    } else if (di != nullptr) forced.push_back(di);
+    std::vector<NetInfo *> combined = forced;
+    for (auto *input : old_inputs)
+        if (std::find(combined.begin(), combined.end(), input) == combined.end()) combined.push_back(input);
+    size_t product_alias_slots = product != nullptr ? 2 - forced.size() : 0;
+    if (combined.size() + product_alias_slots > 4) {
         old_inputs = {propagate};
         old_init = 2;
         copied_source = false;
     }
-    std::vector<NetInfo *> inputs;
-    if (di != nullptr)
-        inputs.push_back(di);
+    std::vector<NetInfo *> inputs = forced;
+    // Keep the two product pins at physical input zero/one even when aliased.
+    if (product != nullptr) inputs = {product->getPort(ctx->id("I0")), product->getPort(ctx->id("I1"))};
     for (auto *input : old_inputs)
         if (std::find(inputs.begin(), inputs.end(), input) == inputs.end())
             inputs.push_back(input);
@@ -114,7 +125,11 @@ IseCarryBit prepare_bit(Context *ctx, CellInfo *mux, CellInfo *xorcy)
     bit.xorcy = xorcy;
     NetInfo *propagate = mux != nullptr ? mux->getPort(id_S) : xorcy->getPort(id_LI);
     NetInfo *di = mux != nullptr ? mux->getPort(id_DI) : nullptr;
-    if (mux != nullptr) {
+    if (di != nullptr && di->driver.cell != nullptr && di->driver.cell->type == ctx->id("MULT_AND")) {
+        bit.andcell = di->driver.cell;
+        bit.di = IseCarryDi::Product;
+        di = nullptr;
+    } else if (mux != nullptr) {
         auto constant = constant_value(di);
         if (constant.has_value()) {
             bit.di = *constant ? IseCarryDi::One : IseCarryDi::Zero;
@@ -126,7 +141,7 @@ IseCarryBit prepare_bit(Context *ctx, CellInfo *mux, CellInfo *xorcy)
             bit.di = IseCarryDi::LutInput;
         }
     }
-    bit.lut = private_lut(ctx, mux != nullptr ? mux : xorcy, propagate, di);
+    bit.lut = private_lut(ctx, mux != nullptr ? mux : xorcy, propagate, di, bit.andcell);
     NetInfo *s = bit.lut->getPort(id_O);
     if (mux != nullptr) {
         mux->disconnectPort(id_S);
@@ -139,7 +154,7 @@ IseCarryBit prepare_bit(Context *ctx, CellInfo *mux, CellInfo *xorcy)
         if (sum != nullptr)
             for (const auto &user : sum->users)
                 if (user.port == id_D && user.cell->cluster == ClusterId() &&
-                    user.cell->type.in(id_FD, id_FDCE, id_FDC, id_FDPE, id_FDP, id_FDRE, id_FDSE, id_FDRSE)) {
+                    user.cell->type.in(id_FD, id_FDCE, id_FDC, id_FDPE, id_FDP, id_FDRE, id_FDSE)) {
                     bit.ff = user.cell;
                     break;
                 }
@@ -151,7 +166,7 @@ void cluster_chain(IseCarryChain &chain)
 {
     for (size_t i = 0; i < chain.bits.size(); i++) {
         const auto &bit = chain.bits[i];
-        for (auto *cell : {bit.mux, bit.xorcy, bit.lut, bit.ff}) {
+        for (auto *cell : {bit.mux, bit.xorcy, bit.lut, bit.ff, bit.andcell}) {
             if (cell == nullptr)
                 continue;
             NPNR_ASSERT(cell->cluster == ClusterId());
@@ -170,6 +185,19 @@ void cluster_chain(IseCarryChain &chain)
 
 std::vector<IseCarryChain> pack_ise_carries(Context *ctx)
 {
+    // ISE MAP permits MULT_AND only as a single MUXCY.DI source. XST can
+    // rewrite other shapes first, but the raw primitive graph must obey MAP.
+    std::vector<CellInfo *> products;
+    for (auto &entry : ctx->cells)
+        if (entry.second->type == ctx->id("MULT_AND")) products.push_back(entry.second.get());
+    std::sort(products.begin(), products.end(), [](CellInfo *a, CellInfo *b) { return a->name < b->name; });
+    for (auto *product : products) {
+        auto *output = product->getPort(ctx->id("LO"));
+        if (output == nullptr) log_error("Spartan-3E ISE: disconnected MULT_AND %s\n", ctx->nameOf(product));
+        if (output->users.entries() != 1 || (*output->users.begin()).cell->type != id_MUXCY ||
+            (*output->users.begin()).port != id_DI)
+            log_error("Spartan-3E ISE: MULT_AND %s must drive exactly one MUXCY.DI (ISE MAP policy)\n", ctx->nameOf(product));
+    }
     std::vector<CellInfo *> muxes, xors;
     for (auto &entry : ctx->cells) {
         if (entry.second->type == id_MUXCY)
@@ -180,11 +208,28 @@ std::vector<IseCarryChain> pack_ise_carries(Context *ctx)
     auto ordered = [](CellInfo *a, CellInfo *b) { return a->name < b->name; };
     std::sort(muxes.begin(), muxes.end(), ordered);
     std::sort(xors.begin(), xors.end(), ordered);
+    // A carry output has one dedicated successor. Other branches retain the
+    // same logical net and start independent chains through a fabric/BX entry,
+    // as ISE MAP does. Pick before rewriting any propagate inputs so neither
+    // iteration order nor private LUT creation changes the decomposition.
+    dict<IdString, CellInfo *> successor;
+    std::unordered_set<CellInfo *> dedicated_children;
+    for (auto *mux : muxes) {
+        std::vector<CellInfo *> children;
+        if (auto *co = mux->getPort(id_O))
+            for (const auto &user : co->users)
+                if (user.cell->type == id_MUXCY && user.port == id_CI)
+                    children.push_back(user.cell);
+        std::sort(children.begin(), children.end(), ordered);
+        if (!children.empty()) {
+            successor[mux->name] = children.front();
+            dedicated_children.insert(children.front());
+        }
+    }
     std::unordered_set<CellInfo *> used;
     std::vector<IseCarryChain> chains;
     for (auto *root : muxes) {
-        NetInfo *ci = root->getPort(id_CI);
-        if (ci != nullptr && ci->driver.cell != nullptr && ci->driver.cell->type == id_MUXCY)
+        if (dedicated_children.count(root))
             continue;
         IseCarryChain chain;
         chain.root = root;
@@ -197,14 +242,7 @@ std::vector<IseCarryChain> pack_ise_carries(Context *ctx)
                 used.insert(xorcy);
             chain.bits.push_back(prepare_bit(ctx, mux, xorcy));
             NetInfo *co = mux->getPort(id_O);
-            CellInfo *next = nullptr;
-            if (co != nullptr)
-                for (const auto &user : co->users)
-                    if (user.cell->type == id_MUXCY && user.port == id_CI) {
-                        if (next != nullptr)
-                            log_error("Spartan-3E ISE: branched carry chain at %s\n", mux->name.c_str(ctx));
-                        next = user.cell;
-                    }
+            CellInfo *next = successor.count(mux->name) ? successor.at(mux->name) : nullptr;
             if (next == nullptr) {
                 auto *terminal = find_xor(co, nullptr, used);
                 if (terminal != nullptr) {
