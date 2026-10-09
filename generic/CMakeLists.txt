@@ -14,22 +14,6 @@ set(SOURCES
     viaduct_helpers.h
     viaduct/example/constids.inc
     viaduct/example/example.cc
-    viaduct/spartan3e/constids.inc
-    viaduct/spartan3e/spartan3e.cc
-    viaduct/spartan3e/spartan3e_ise.cc
-    viaduct/spartan3e/spartan3e_ise.h
-    viaduct/spartan3e/spartan3e_ise_carry.cc
-    viaduct/spartan3e/spartan3e_ise_carry.h
-    viaduct/spartan3e/spartan3e_ise_wide.cc
-    viaduct/spartan3e/spartan3e_ise_wide.h
-    viaduct/spartan3e/spartan3e_ise_clock.cc
-    viaduct/spartan3e/spartan3e_ise_bram.cc
-    viaduct/spartan3e/spartan3e_ise_clock_model.cc
-    viaduct/spartan3e/spartan3e_ise_clock.h
-    viaduct/spartan3e/spartan3e_ise_db.cc
-    viaduct/spartan3e/spartan3e_ise_db.h
-    viaduct/spartan3e/spartan3e_xdl.cc
-    viaduct/spartan3e/spartan3e_xdl.h
     viaduct/fabulous/constids.inc
     viaduct/fabulous/fab_cfg.h
     viaduct/fabulous/fab_defs.h
